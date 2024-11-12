@@ -16,21 +16,24 @@ class AirSimDroneEnv(AirSimEnv):
         self.img_shape = img_shape
         self.target_position = np.array(target_position)
         self.start_position = np.array(start_position)
-        self.min_threshold = float(-2 * np.linalg.norm(self.start_position - self.target_position))
+        self.max_distance = float(1.5 * np.linalg.norm(self.start_position - self.target_position))
+        self.previous_distance_to_target=np.linalg.norm(self.start_position - self.target_position)
         self.max_velocity = max_velocity  # Maximum velocity in m/s
         self.max_yaw_rate = max_yaw_rate  # Maximum yaw change in degrees per step
+        self.previous_min_depth = None
+        self.previous_velocity = np.zeros(3, dtype=np.float32)
 
         # Setup flight
         self._setup_flight()
 
         # Define observation space (depth image + drone state + relative orientation)
         self.observation_space = spaces.Dict({
-            "depth_image": spaces.Box(low=0, high=255, shape=self.img_shape, dtype=np.uint8),
-            #"drone_position": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
+            #"depth_image": spaces.Box(low=0, high=255, shape=self.img_shape, dtype=np.uint8),
+            "drone_position": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
             #"target_position": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
             #"orientation": spaces.Box(low=-np.pi, high=np.pi, shape=(3,), dtype=np.float32),  # roll, pitch, yaw in radians
             "linear_velocity": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
-            "relative_distance": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
+            #"relative_distance": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
             "relative_yaw": spaces.Box(low=-np.pi, high=np.pi, shape=(1,), dtype=np.float32),  # Yaw angle to align with target
         })
 
@@ -44,7 +47,8 @@ class AirSimDroneEnv(AirSimEnv):
         self.client.enableApiControl(True)
         self.client.armDisarm(True)
         self.client.takeoffAsync().join()
-        self.client.moveToPositionAsync(*self.start_position, 10).join()
+        x,y,z=float(self.start_position[0]),float(self.start_position[1]),float(self.start_position[2])
+        self.client.moveToPositionAsync(x,y,z, 10).join()
 
     def reset(self, **kwargs):
         if 'seed' in kwargs:
@@ -52,6 +56,7 @@ class AirSimDroneEnv(AirSimEnv):
         
         # Reset environment and set to start position
         self.client.reset()
+        self.previous_distance_to_target = np.linalg.norm(self.start_position - self.target_position)
         self._setup_flight()
 
         # Get initial observation
@@ -64,22 +69,14 @@ class AirSimDroneEnv(AirSimEnv):
         vz = float(action[2] * self.max_velocity)
         yaw_rate = float(action[3] * self.max_yaw_rate)  # Max yaw rate change in degrees per step
 
-        # Get current yaw, adjust it by yaw_rate
-        #current_yaw = self.get_current_yaw()
-        #new_yaw = current_yaw + np.deg2rad(yaw_rate)  # Convert degrees to radians
-
-        # Move by velocity and set yaw
-        #self.client.moveByVelocityZAsync(vx, vy, vz, yaw_mode=new_yaw, duration=0.3).join()
         self.client.rotateByYawRateAsync(yaw_rate,duration=0.3).join()
         self.client.moveByVelocityAsync(vx,vy,vz,duration=0.3).join()
         # Get new state and compute reward
         obs = self._get_observation()
-        reward, done = self._compute_reward_and_done(obs["drone_position"])
-
+        reward, done = self._compute_reward_and_done(obs)
         # Truncate if reward drops below threshold
         terminated = done
-        truncated = reward < self.min_threshold and not terminated
-
+        truncated = np.linalg.norm(obs["drone_position"] - self.target_position) > self.max_distance and not terminated
         return obs, reward, terminated, truncated, {}
 
     def get_current_yaw(self):
@@ -102,8 +99,8 @@ class AirSimDroneEnv(AirSimEnv):
 
     def _get_observation(self):
         # Get depth image and resize
-        depth_image = self._get_depth_image()
-        depth_image = depth_image.reshape(self.img_shape)
+        #depth_image = self._get_depth_image()
+        #depth_image = depth_image.reshape(self.img_shape)
 
         # Get drone's current position, orientation, linear velocity
         drone_state = self.client.getMultirotorState()
@@ -119,19 +116,19 @@ class AirSimDroneEnv(AirSimEnv):
         current_velocity = np.array([linear_velocity.x_val, linear_velocity.y_val, linear_velocity.z_val])
 
         # Relative distance to target (component-wise difference)
-        relative_distance = self.target_position - current_position
+        #relative_distance = self.target_position - current_position
 
         # Relative yaw to face the target
         current_yaw = orientation_euler[2]  # Extract the yaw angle
         relative_yaw = self._get_relative_yaw_to_target(current_position, current_yaw)
 
         return {
-            "depth_image": depth_image,
-            #"drone_position": current_position,
+            #"depth_image": depth_image,
+            "drone_position": current_position,
             #"target_position": self.target_position,
             #"orientation": np.array(orientation_euler),  # roll, pitch, yaw
             "linear_velocity": current_velocity,
-            "relative_distance": relative_distance,
+            #"relative_distance": relative_distance,
             "relative_yaw": np.array([relative_yaw]),  # Yaw difference to align with the target
         }
 
@@ -149,46 +146,57 @@ class AirSimDroneEnv(AirSimEnv):
         return cv2.resize(depth_data, (self.img_shape[0], self.img_shape[1]))
 
     #TO DO improve the reward function
-    def _compute_reward_and_done(self, drone_position, current_velocity, relative_yaw):
+    def _compute_reward_and_done(self, obs):
         # Calculate distance to target
+        drone_position,current_velocity,relative_yaw = obs["drone_position"],obs["linear_velocity"],obs["relative_yaw"]
         distance_to_target = np.linalg.norm(drone_position - self.target_position)
-
-        # Reward for getting closer to the target (based on change in distance)
         distance_reward = self.previous_distance_to_target - distance_to_target
         self.previous_distance_to_target = distance_to_target
 
-        # Penalize for misalignment in yaw
-        alignment_reward = -abs(relative_yaw)  # Negative reward for misalignment
-
-        # Penalize large changes in velocity to encourage smooth movement
+        # Penalize yaw misalignment when no obstacle is close
+        yaw_penalty = -5 * abs(relative_yaw) if distance_to_target > 5.0 else -abs(relative_yaw)
+        
+        # Reward for reducing distance to obstacles if moving away from the nearest one
+        min_depth, quadrant_depths = self._get_obstacle_proximity_features()
+        obstacle_reward = 0
+        if min_depth < 5.0 and self.previous_min_depth is not None and min_depth > self.previous_min_depth:
+            obstacle_reward = 10 * (min_depth - self.previous_min_depth)
+        self.previous_min_depth = min_depth
+        
+        # Smooth movement penalty for excessive velocity changes
         velocity_change_penalty = -np.linalg.norm(current_velocity - self.previous_velocity)
         self.previous_velocity = current_velocity
-
-        # Proximity bonus
-        proximity_bonus = 0
-        if distance_to_target < 3.0:
-            proximity_bonus = 10  # Bonus for getting close to the target
+        
+        # Proximity bonus for getting closer to the target
+        proximity_bonus = 10 / (1 + distance_to_target) if distance_to_target < 3.0 else 0
         if distance_to_target < 1.5:
-            proximity_bonus = 100  # Large reward for reaching the target
+            proximity_bonus += 100  # Large reward for reaching the target
             done = True
-
+        
         # Collision penalty
         collision = self.client.simGetCollisionInfo().has_collided
         collision_penalty = -1e6 if collision else 0
         if collision:
             done = True
 
-        # Time penalty
-        time_penalty = -0.1  # Small penalty to encourage faster completion
+        # Time penalty to encourage faster completion
+        time_penalty = -0.1
+        
+        # Combine all rewards and penalties
+        reward = (
+            distance_reward +
+            yaw_penalty +
+            obstacle_reward +
+            #velocity_change_penalty +
+            proximity_bonus +
+            collision_penalty +
+            time_penalty
+        )
 
-        # Combine all rewards
-        reward = (distance_reward+alignment_reward+velocity_change_penalty+ proximity_bonus+ collision_penalty+ time_penalty)
-
-        # Episode termination
-        done = collision or distance_to_target < 0.5
-
+        # Determine episode termination
+        done = collision or distance_to_target < 1
         return reward, done
-
+    
     def close(self):
         self.client.armDisarm(False)
         self.client.enableApiControl(False)
