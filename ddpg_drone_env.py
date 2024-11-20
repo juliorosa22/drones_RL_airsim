@@ -6,7 +6,7 @@ from airgym.envs.airsim_env import AirSimEnv
 import cv2
 from scipy.spatial.transform import Rotation as R
 
-class AirSimDroneEnv(AirSimEnv):
+class DDPGAirSimDroneEnv(AirSimEnv):
     def __init__(self, ip_address, img_shape, start_position, target_position, max_velocity=5, max_yaw_rate=45):
         super().__init__()
 
@@ -56,9 +56,10 @@ class AirSimDroneEnv(AirSimEnv):
         
         # Reset environment and set to start position
         self.client.reset()
-        self.previous_distance_to_target = np.linalg.norm(self.start_position - self.target_position)
         self._setup_flight()
-
+        self.previous_distance_to_target = np.linalg.norm(self.start_position - self.target_position)
+        self.previous_min_depth = None
+        self.previous_velocity = np.zeros(3, dtype=np.float32)
         # Get initial observation
         return self._get_observation(), {}
 
@@ -73,10 +74,10 @@ class AirSimDroneEnv(AirSimEnv):
         self.client.moveByVelocityAsync(vx,vy,vz,duration=0.3).join()
         # Get new state and compute reward
         obs = self._get_observation()
-        reward, done = self._compute_reward_and_done(obs)
+        reward, done , target_dist= self._compute_reward_and_done(obs)
         # Truncate if reward drops below threshold
         terminated = done
-        truncated = np.linalg.norm(obs["drone_position"] - self.target_position) > self.max_distance and not terminated
+        truncated = target_dist > self.max_distance and not terminated
         return obs, reward, terminated, truncated, {}
 
     def get_current_yaw(self):
@@ -137,6 +138,25 @@ class AirSimDroneEnv(AirSimEnv):
         rotation = R.from_quat([quaternion.x_val, quaternion.y_val, quaternion.z_val, quaternion.w_val])
         return rotation.as_euler('xyz', degrees=False)  # Returns roll, pitch, yaw
 
+    def _get_obstacle_proximity_features(self):
+        # Get depth image and preprocess
+        depth_image = self._get_depth_image()
+
+        # 1. Minimum Depth Value (nearest obstacle)
+        min_depth = np.min(depth_image)
+
+        # 2. Quadrant-Based Minimum Depths
+        h, w = depth_image.shape
+        quadrants = [
+            depth_image[:h//2, :w//2],     # Top-left
+            depth_image[:h//2, w//2:],     # Top-right
+            depth_image[h//2:, :w//2],     # Bottom-left
+            depth_image[h//2:, w//2:],     # Bottom-right
+        ]
+        quadrant_depths = [np.min(quad) for quad in quadrants]
+
+        return min_depth, quadrant_depths
+
     def _get_depth_image(self):
         # Get depth image from AirSim
         responses = self.client.simGetImages([airsim.ImageRequest("front_center", airsim.ImageType.DepthPerspective, True, False)])
@@ -145,34 +165,36 @@ class AirSimDroneEnv(AirSimEnv):
         depth_data = (255.0 * depth_data / np.max(depth_data)).astype(np.uint8)  # Normalize
         return cv2.resize(depth_data, (self.img_shape[0], self.img_shape[1]))
 
-    #TO DO improve the reward function
     def _compute_reward_and_done(self, obs):
+        # Initialize done flag
+        done = False
+        
         # Calculate distance to target
-        drone_position,current_velocity,relative_yaw = obs["drone_position"],obs["linear_velocity"],obs["relative_yaw"]
+        drone_position, current_velocity, relative_yaw = obs["drone_position"], obs["linear_velocity"], obs["relative_yaw"]
         distance_to_target = np.linalg.norm(drone_position - self.target_position)
         distance_reward = self.previous_distance_to_target - distance_to_target
         self.previous_distance_to_target = distance_to_target
 
         # Penalize yaw misalignment when no obstacle is close
         yaw_penalty = -5 * abs(relative_yaw) if distance_to_target > 5.0 else -abs(relative_yaw)
-        
-        # Reward for reducing distance to obstacles if moving away from the nearest one
+
+        # Reward for moving away from the nearest obstacle
         min_depth, quadrant_depths = self._get_obstacle_proximity_features()
         obstacle_reward = 0
         if min_depth < 5.0 and self.previous_min_depth is not None and min_depth > self.previous_min_depth:
             obstacle_reward = 10 * (min_depth - self.previous_min_depth)
         self.previous_min_depth = min_depth
-        
-        # Smooth movement penalty for excessive velocity changes
-        velocity_change_penalty = -np.linalg.norm(current_velocity - self.previous_velocity)
+
+        # Smooth movement penalty for excessive velocity changes (uncomment if needed)
+        # velocity_change_penalty = -np.linalg.norm(current_velocity - self.previous_velocity)
         self.previous_velocity = current_velocity
-        
+
         # Proximity bonus for getting closer to the target
-        proximity_bonus = 10 / (1 + distance_to_target) if distance_to_target < 3.0 else 0
+        proximity_bonus = 10 / (0.1 + distance_to_target) if distance_to_target < 3.0 else 0
         if distance_to_target < 1.5:
             proximity_bonus += 100  # Large reward for reaching the target
             done = True
-        
+
         # Collision penalty
         collision = self.client.simGetCollisionInfo().has_collided
         collision_penalty = -1e6 if collision else 0
@@ -181,21 +203,21 @@ class AirSimDroneEnv(AirSimEnv):
 
         # Time penalty to encourage faster completion
         time_penalty = -0.1
-        
-        # Combine all rewards and penalties
+
+        # Combine all rewards and penalties with appropriate scaling
         reward = (
-            distance_reward +
+            10 * distance_reward +
             yaw_penalty +
             obstacle_reward +
-            #velocity_change_penalty +
+            # velocity_change_penalty +  # Uncomment if needed
             proximity_bonus +
             collision_penalty +
             time_penalty
         )
 
         # Determine episode termination
-        done = collision or distance_to_target < 1
-        return reward, done
+        done = done or distance_to_target < 1
+        return reward, done, distance_to_target
     
     def close(self):
         self.client.armDisarm(False)
