@@ -64,6 +64,7 @@ class QuadAirSimDroneEnv(AirSimEnv):
 
     def update_path(self):
         path = self.path_handler.get_next_path()
+        print(f"Next Path selected:{path['path_id']}")
         point=self.path_handler.get_next_point()
         self.target_position = np.array(point['target_position'],dtype=np.float32)
         self.start_position = np.array(point['start_position'],dtype=np.float32)
@@ -318,16 +319,17 @@ class QuadAirSimDroneEnv(AirSimEnv):
         lidar_data = self.client.getLidarData()
         
         # Initialize rewards and penalties
-        close_target_reward=0 #range 0 or 1
-        displacement_reward = 0 #range 0 or 0.5
-        direction_reward=0 #range [-1, 1]
-        yaw_reward=0 #range 0 or [2/3,1]
-        lidar_reward = 0 #range[0,1] based on the percentage of distances above the threshold
-        lidar_penalty = 0 #range[0,1] based on the percentage of distances below the threshold
+        close_target_reward=0.0 #(a): range 0 or 1
+        direction_reward=0.0 #(b): range[-1, 1]
+        displacement_reward = 0.0 #(c): range 0 or 0.5
+        yaw_reward=0 #(d): range 0 or [2/3,1]
+        foward_reward =0.0 #(e): range [-1, 1]
+        lidar_reward = 0 #(f): range[0,1] based on the percentage of distances above the threshold
+        lidar_penalty = 0 # (g): range[0,1] based on the percentage of distances below the threshold
         collision_penalty = 0
         
         # ---- 1. Distance Based ----
-        #(a) proximity reward based on current distance from target
+        #(a)----- proximity reward based on current distance from target
         dist_target = np.linalg.norm(target_position-drone_position)
         start_dist_target=np.linalg.norm(target_position-self.start_position)
         if dist_target < 3:
@@ -336,12 +338,10 @@ class QuadAirSimDroneEnv(AirSimEnv):
                 done=True
         else:
             close_target_reward=0
-        
-        
-        # (b) Scalar product reward for movement in the target direction
-        movement_vector = drone_position - previous_position
-        prev_dist_vector = target_position - previous_position#drone_position
 
+        #(b)-----  Scalar product reward for movement in the target direction
+        movement_vector = drone_position - previous_position
+        prev_dist_vector = target_position - previous_position
         # Normalize vectors to calculate scalar product
         if np.linalg.norm(movement_vector) > 0 and np.linalg.norm(prev_dist_vector) > 0:
             movement_vector_normalized = movement_vector / np.linalg.norm(movement_vector)
@@ -349,16 +349,30 @@ class QuadAirSimDroneEnv(AirSimEnv):
             direction_reward = np.dot(movement_vector_normalized, prev_distance_vector_normalized)
     
 
-        # (c) Reward based on the displacement
+        #(c)-----  Reward based on the displacement
         previous_distance_to_target = np.linalg.norm(self.previous_position - target_position)
         current_distance_to_target = np.linalg.norm(drone_position - target_position)
         delta_displacement= previous_distance_to_target - current_distance_to_target
         displacement_reward= 0.5 if delta_displacement > 0 else 0
 
-        # (c) Drone yaw alignment reward, measures if the drone is aligned with the target
+        #(d)-----  Drone yaw alignment reward, measures if the drone is aligned with the target
         relative_yaw=obs["relative_yaw"]
         yaw_reward= (np.pi-abs(relative_yaw))/np.pi if -(np.pi/3) <= relative_yaw <= (np.pi/3) else 0
         
+        #(e)-----  This reward tries to incentivize the drone movement in its camera-facing position
+        orientation = obs["orientation"]  # Assuming the drone's orientation is provided in roll, pitch, yaw
+        yaw = orientation[2]  # Extract yaw in radians
+        facing_direction = np.array([np.cos(yaw), np.sin(yaw), 0])  # Facing direction vector in X-Y plane
+        # Calculate movement direction based on positions
+        movement_vector_norm = np.zeros_like(movement_vector)
+        if np.linalg.norm(movement_vector) > 1e-6:  # Avoid division by zero
+            movement_vector_norm = movement_vector/np.linalg.norm(movement_vector)  # Normalize
+            
+        # Check alignment between movement and facing direction
+        foward_reward = np.dot(facing_direction[:2], movement_vector_norm[:2])  # Consider only X-Y plane for alignment
+        
+
+
         # ---- 2. LiDAR Based ----
         # Parse LiDAR data into 3D point cloud
         if len(lidar_data.point_cloud) < 3:
@@ -375,13 +389,13 @@ class QuadAirSimDroneEnv(AirSimEnv):
             if len(front_distances) > 0:
                 average_front_distance = np.mean(front_distances)
                 #if the current mean distance is bigger than the minimum threshold apply reward based on how many distances above the mean are in the front of the drone
+                #(f) -------- Reward for movement in wide open space
                 if average_front_distance > self.min_dist_obs:
                     above_mean_count = np.sum(front_distances > average_front_distance*0.9)
                     # Calculate the percentage of distances above the mean
                     lidar_reward = (above_mean_count / len(front_distances))
-                # (b) Penalty for proximity to obstacles        
-                if average_front_distance <= self.min_dist_obs:
-                    min_distance_to_obstacle = np.min(distances_to_points)
+                # (g)------ Penalty for proximity to obstacles        
+                if average_front_distance <= self.min_dist_obs:                    
                     below_mean_count = np.sum(front_distances < average_front_distance)
                     # Calculate the percentage of distances above the mean
                     lidar_penalty = (below_mean_count / len(front_distances))
@@ -390,6 +404,7 @@ class QuadAirSimDroneEnv(AirSimEnv):
             6*close_target_reward+
             displacement_reward+
             direction_reward+
+            foward_reward+
             yaw_reward+
             lidar_reward-lidar_penalty                        
         )
