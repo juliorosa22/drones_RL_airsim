@@ -5,33 +5,36 @@ import airsim
 from airgym.envs.airsim_env import AirSimEnv
 import cv2
 from scipy.spatial.transform import Rotation as R
+from path_handler import PathHandler
 
-class DDPGAirSimDroneEnv(AirSimEnv):
-    def __init__(self, ip_address, img_shape, start_position, target_position,prox_tresh=5 ,max_velocity=10, max_yaw_rate=np.pi/4):
+class QuadAirSimDroneEnv(AirSimEnv):
+    def __init__(self, ip_address, img_shape, path_file,min_dist=2 ,max_velocity=10):
         super().__init__()
-
         # Connect to AirSim
         self.client = airsim.MultirotorClient(ip=ip_address)
         self.client.confirmConnection()
         self.img_shape = img_shape
-        self.target_position = np.array(target_position)
-        self.start_position = np.array(start_position)
+        #paths handler
+        self.path_handler=PathHandler(path_file)
+        #drone initial state
+        self.start_position=np.zeros(3, dtype=np.float32)
+        self.target_position_position=np.zeros(3, dtype=np.float32)
+        self.max_distance = np.zeros(3, dtype=np.float32)
         self.max_velocity = max_velocity  # Maximum velocity in m/s
-        self.max_distance = float(1.5 * np.linalg.norm(self.start_position - self.target_position))
-        self.max_yaw_rate = max_yaw_rate  # Maximum yaw change in degrees per step
+        
         self.drone_orientation=np.zeros(3, dtype=np.float32)
-        self.previous_distance_to_target=np.linalg.norm(self.start_position - self.target_position)
+        #self.previous_distance_to_target=np.linalg.norm(self.start_position - self.target_position)
         self.previous_altitude = 0.0
-        self.previous_min_depth = 0
+        #self.previous_min_depth = 0
         self.previous_perc_range=0.0
         self.previous_position=np.zeros(3, dtype=np.float32)
-        self.prox_tresh=prox_tresh #paramater that defines when consider change yaw aligment due proximity to some obstacle in front of the drone
+        self.min_dist_obs=min_dist #minimum distance threshold to penalize the drone when getting closer to obstacles
         self.previous_velocity = np.zeros(3, dtype=np.float32)
+        #simulation counters
         self.collision_counter=0
-
-        # Setup flight
+        self.step_count=0
+        self.update_path()
         self._setup_flight()
-
         # Define observation space (depth image + drone state + relative orientation)
         self.observation_space = spaces.Dict({
             #"depth_image": spaces.Box(low=0, high=255, shape=self.img_shape, dtype=np.uint8),
@@ -44,6 +47,7 @@ class DDPGAirSimDroneEnv(AirSimEnv):
         })
 
         # Define action space (limited [-1, 1] for vx, vy, vz, and yaw ratem(rads/sec))
+        #change the action space
         self.action_space = spaces.Box(low=-1, high=1, shape=(4,), dtype=np.float32)
 
     def __del__(self):
@@ -51,20 +55,29 @@ class DDPGAirSimDroneEnv(AirSimEnv):
 
     def _set_previous_states(self):
         obs=self._get_obs()
-        depth_image=self._get_depth_image()
+        #depth_image=self._get_depth_image()
         self.start_position = obs["drone_position"]
         self.previous_position=obs["drone_position"]
         self.previous_altitude = float(self.start_position[2])
         self.previous_velocity=obs["linear_velocity"]
-        self.previous_min_depth, self.previous_perc_range = self._get_obstacle_proximity_features(depth_image)
+        #self.previous_min_depth, self.previous_perc_range = self._get_obstacle_proximity_features(depth_image)
+
+    def update_path(self):
+        path = self.path_handler.get_next_path()
+        point=self.path_handler.get_next_point()
+        self.target_position = np.array(point['target_position'],dtype=np.float32)
+        self.start_position = np.array(point['start_position'],dtype=np.float32)
+        self.max_distance= 1.5*np.linalg.norm(self.target_position - self.start_position)
 
     def _setup_flight(self):
         self.client.reset()
         self.client.enableApiControl(True)
         self.client.armDisarm(True)
         #self.client.takeoffAsync().join()
-        x,y,z=float(self.start_position[0]),float(self.start_position[1]),float(self.start_position[2])
-        self.client.moveToPositionAsync(x,y,z, 10).join()
+        state = self.client.getMultirotorState()
+        if state.landed_state == airsim.LandedState.Landed:
+            x,y,z=float(self.start_position[0]),float(self.start_position[1]),float(self.start_position[2])
+            self.client.moveToPositionAsync(x,y,z, 0.75*self.max_velocity).join()
         self._set_previous_states()
         
     def reset(self, **kwargs):
@@ -73,6 +86,8 @@ class DDPGAirSimDroneEnv(AirSimEnv):
         
         # Reset environment and set to start position
         self.collision_counter=0
+        self.step_count=0
+        self.update_path()
         self._setup_flight()
         # Get initial observation
         return self._get_obs(), {}
@@ -172,6 +187,12 @@ class DDPGAirSimDroneEnv(AirSimEnv):
             #"relative_distance": relative_distance,
             "relative_yaw": np.array([relative_yaw]),  # Yaw difference to align with the target
         }
+
+    def parse_lidarData(self, data):
+        # reshape array of floats to array of [X,Y,Z]
+        points = np.array(data.point_cloud, dtype=np.dtype('f4'))
+        points = np.reshape(points, (int(points.shape[0]/3), 3))
+        return points
 
     def _compute_reward(self, obs):
         # Initialize done flag
@@ -288,6 +309,108 @@ class DDPGAirSimDroneEnv(AirSimEnv):
 
         return float(reward), done, distance_to_target
 
+    def new_reward(self,obs):
+        done=False
+        # Extract required observation data
+        drone_position = obs["drone_position"]
+        previous_position = self.previous_position
+        target_position = self.target_position
+        lidar_data = self.client.getLidarData()
+        
+        # Initialize rewards and penalties
+        close_target_reward=0 #range 0 or 1
+        displacement_reward = 0 #range 0 or 0.5
+        direction_reward=0 #range [-1, 1]
+        yaw_reward=0 #range 0 or [2/3,1]
+        lidar_reward = 0 #range[0,1] based on the percentage of distances above the threshold
+        lidar_penalty = 0 #range[0,1] based on the percentage of distances below the threshold
+        collision_penalty = 0
+        
+        # ---- 1. Distance Based ----
+        #(a) proximity reward based on current distance from target
+        dist_target = np.linalg.norm(target_position-drone_position)
+        start_dist_target=np.linalg.norm(target_position-self.start_position)
+        if dist_target < 3:
+            close_target_reward=1
+            if dist_target < 1:
+                done=True
+        else:
+            close_target_reward=0
+        
+        
+        # (b) Scalar product reward for movement in the target direction
+        movement_vector = drone_position - previous_position
+        prev_dist_vector = target_position - previous_position#drone_position
+
+        # Normalize vectors to calculate scalar product
+        if np.linalg.norm(movement_vector) > 0 and np.linalg.norm(prev_dist_vector) > 0:
+            movement_vector_normalized = movement_vector / np.linalg.norm(movement_vector)
+            prev_distance_vector_normalized = prev_dist_vector / np.linalg.norm(prev_dist_vector)
+            direction_reward = np.dot(movement_vector_normalized, prev_distance_vector_normalized)
+    
+
+        # (c) Reward based on the displacement
+        previous_distance_to_target = np.linalg.norm(self.previous_position - target_position)
+        current_distance_to_target = np.linalg.norm(drone_position - target_position)
+        delta_displacement= previous_distance_to_target - current_distance_to_target
+        displacement_reward= 0.5 if delta_displacement > 0 else 0
+
+        # (c) Drone yaw alignment reward, measures if the drone is aligned with the target
+        relative_yaw=obs["relative_yaw"]
+        yaw_reward= (np.pi-abs(relative_yaw))/np.pi if -(np.pi/3) <= relative_yaw <= (np.pi/3) else 0
+        
+        # ---- 2. LiDAR Based ----
+        # Parse LiDAR data into 3D point cloud
+        if len(lidar_data.point_cloud) < 3:
+            lidar_points = np.empty((0, 3))  # No points received, empty array
+        else:
+            lidar_points = self.parse_lidarData(lidar_data)
+
+        if lidar_points.size > 0:
+            # (a) Reward for open spaces in front
+            distances_to_points = np.linalg.norm(lidar_points, axis=1)
+            front_area_indices = lidar_points[:, 0] > 0  # Points in front of the drone
+            front_distances = distances_to_points[front_area_indices]
+
+            if len(front_distances) > 0:
+                average_front_distance = np.mean(front_distances)
+                #if the current mean distance is bigger than the minimum threshold apply reward based on how many distances above the mean are in the front of the drone
+                if average_front_distance > self.min_dist_obs:
+                    above_mean_count = np.sum(front_distances > average_front_distance*0.9)
+                    # Calculate the percentage of distances above the mean
+                    lidar_reward = (above_mean_count / len(front_distances))
+                # (b) Penalty for proximity to obstacles        
+                if average_front_distance <= self.min_dist_obs:
+                    min_distance_to_obstacle = np.min(distances_to_points)
+                    below_mean_count = np.sum(front_distances < average_front_distance)
+                    # Calculate the percentage of distances above the mean
+                    lidar_penalty = (below_mean_count / len(front_distances))
+                    
+        estimated_reward = ( 
+            6*close_target_reward+
+            displacement_reward+
+            direction_reward+
+            yaw_reward+
+            lidar_reward-lidar_penalty                        
+        )
+        
+        #when the penalties are bigger than the rewards
+        if estimated_reward < 0:
+            estimated_reward=np.log(estimated_reward)*np.log(self.step_count)
+        else:
+            estimated_reward = np.power(2,int(abs(estimated_reward)))
+        # ---- 3. Collision Penalty ----
+        collision = self.client.simGetCollisionInfo().has_collided
+        if collision:
+            collision_penalty = -np.power(2,int(abs(estimated_reward))+1)   # Proportional to previous rewards/penalties
+
+        
+        total_reward = float(estimated_reward+collision_penalty)
+
+        # Update state for next reward calculation
+        self.previous_position = drone_position
+
+        return total_reward, done, dist_target
     
     def _do_action(self,action):
         # Scale action values to the desired range
@@ -304,14 +427,28 @@ class DDPGAirSimDroneEnv(AirSimEnv):
         #self.client.rotateByYawRateAsync(yaw_rate,duration=0.5).join()
         #self.client.moveByVelocityAsync(c_vx+a_vx,c_vy+a_vy,c_vz+a_vz,duration=0.5).join()
 
+    def update_points(self):
+        new_points=self.path_handler.get_next_point()    
+        if new_points is None:
+            return True
+        self.start_position = np.array(new_points['start_position'],dtype=np.float32)
+        self.target_position = np.array(new_points['target_position'],dtype=np.float32)
+        return False
+
     def step(self, action):
+        done_point,done_path=False, False
+        self.step_count+=1
+
         self._do_action(action)
         # Get new state and compute reward
         obs = self._get_obs()
-        reward, done , target_dist= self._compute_reward(obs)
+        reward, done_point,dist_target = self.new_reward(obs)
+        if done_point:
+            done_path=self.update_points()
+        
+        terminated = True if done_path else False # Finish the current episode in case all the points in the path were used
         # Truncate if reward drops below threshold
-        terminated = True if done else False
-        truncated = True if target_dist > self.max_distance and not terminated else False
+        truncated = True if dist_target > self.max_distance else False
         return obs, reward, terminated, truncated, {}
 
     def close(self):
