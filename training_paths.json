@@ -1,0 +1,103 @@
+{
+    "paths": [
+      {
+        "path_id": 1,
+        "points": [
+          {
+            "start_position": [-20, 60, -5],
+            "target_position": [-45, 60, -5]
+          },
+          {
+            "start_position": [-45, 60, -5],
+            "target_position": [-65, 60, -5]
+          },
+          {
+            "start_position": [-65, 60, -5],
+            "target_position": [-85, 60, -5]
+          },
+          {
+            "start_position": [-85, 60, -5],
+            "target_position": [-105, 60, -5]
+          }
+        ]
+      },
+      {
+        "path_id": 2,
+        "points": [
+          {
+            "start_position": [-20, 30, -5],
+            "target_position": [-50, 30, -5]
+          },
+          {
+            "start_position": [-50, 30, -5],
+            "target_position": [-80, 30, -5]
+          }
+        ]
+      },
+      {
+        "path_id": 3,
+        "points": [
+          {
+            "start_position": [-20, 0, -5],
+            "target_position": [-45, 0, -5]
+          },
+          {
+            "start_position": [-45, 0, -5],
+            "target_position": [-65, 0, -5]
+          },
+          {
+            "start_position": [-65, 0, -5],
+            "target_position": [-85, 0, -5]
+          },
+          {
+            "start_position": [-85, 0, -5],
+            "target_position": [-105, 0, -5]
+          }
+        ]
+      },
+      {
+        "path_id": 4,
+        "points": [
+          {
+            "start_position": [-20, -30, -5],
+            "target_position": [-50, -30, -5]
+          },
+          {
+            "start_position": [-50, -30, -5],
+            "target_position": [-80, -30, -5]
+          }
+        ]
+      },
+      {
+        "path_id": 5,
+        "points": [
+          {
+            "start_position": [-20, -60, -5],
+            "target_position": [-45, -60, -5]
+          },
+          {
+            "start_position": [-45, -60, -5],
+            "target_position": [-65, -60, -5]
+          },
+          {
+            "start_position": [-65, -60, -5],
+            "target_position": [-85, -60, -5]
+          }
+        ]
+      },
+      {
+        "path_id": 6,
+        "points": [
+          {
+            "start_position": [-20, -90, -5],
+            "target_position": [-50, -90, -5]
+          },
+          {
+            "start_position": [-50, -90, -5],
+            "target_position": [-80, -90, -5]
+          }
+        ]
+      }
+    ]
+  }
+  
