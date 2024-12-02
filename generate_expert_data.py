@@ -116,7 +116,7 @@ class ExpertDataCollector:
                     expert_points.append(obs_vec)
                     expert_actions.append(id)
                         
-                        
+                       ## 
                 #Movement to deslocate from the current initial position
                 delta_pos=10 if move_away =='left' else -10
                         
