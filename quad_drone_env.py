@@ -3,12 +3,16 @@ import numpy as np
 from gymnasium import spaces
 import airsim
 from airgym.envs.airsim_env import AirSimEnv
-import cv2
 from scipy.spatial.transform import Rotation as R
 from path_handler import PathHandler
-
+import time
+import os
+import csv
+MAX_STEPS_PER_EPISODE=500
+LIDAR_FEAT_SIZE=300
 class QuadAirSimDroneEnv(AirSimEnv):
-    def __init__(self, ip_address, img_shape, path_file,max_yaw_rate=45,min_dist=2 ,max_velocity=10):
+    
+    def __init__(self, ip_address, img_shape, path_file,csv_file_log,max_yaw_rate=45,min_dist=2,max_velocity=10):
         super().__init__()
         # Connect to AirSim
         self.client = airsim.MultirotorClient(ip=ip_address)
@@ -23,45 +27,41 @@ class QuadAirSimDroneEnv(AirSimEnv):
         self.max_velocity = max_velocity  # Maximum velocity in m/s
         self.max_yaw_rate=max_yaw_rate
         self.drone_orientation=np.zeros(3, dtype=np.float32)
-        #self.previous_distance_to_target=np.linalg.norm(self.start_position - self.target_position)
-        self.previous_altitude = 0.0
-        #self.previous_min_depth = 0
-        self.previous_perc_range=0.0
+        
         self.previous_position=np.zeros(3, dtype=np.float32)
         self.min_dist_obs=min_dist #minimum distance threshold to penalize the drone when getting closer to obstacles
         self.previous_velocity = np.zeros(3, dtype=np.float32)
-        #simulation counters
-        self.collision_counter=0
-        self.step_count=0
         self.update_path()
         self._setup_flight()
-        # Define observation space (depth image + drone state + relative orientation)
-        self.observation_space = spaces.Dict({
-            #"depth_image": spaces.Box(low=0, high=255, shape=self.img_shape, dtype=np.uint8),
-            "drone_position": spaces.Box(low=np.array([-100, -100, -100]), high=np.array([100, 100, 100]), dtype=np.float32),
-            #"target_position": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
-            "orientation": spaces.Box(low=np.array([-np.pi,-np.pi,-np.pi]), high=np.array([np.pi,np.pi,np.pi]), dtype=np.float32),  # roll, pitch, yaw in radians
-            "linear_velocity": spaces.Box(low=np.array([-self.max_velocity, -self.max_velocity, -self.max_velocity]), high=np.array([self.max_velocity, self.max_velocity, self.max_velocity]), dtype=np.float32),
-            #"relative_distance": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
-            "relative_yaw": spaces.Box(low=-np.pi, high=np.pi, shape=(1,), dtype=np.float32),  # Yaw angle to align with target
-        })
+        
 
-        # Define action space (limited [-1, 1] for vx, vy, vz, and yaw ratem(rads/sec))
-        #change the action space
-        self.action_space = spaces.Box(low=-1, high=1, shape=(4,), dtype=np.float32)
+        # Flatten the observation space
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(9+LIDAR_FEAT_SIZE,),
+            dtype=np.float32
+        )
+        self.action_space = spaces.Discrete(7)
 
-    def __del__(self):
-        self.client.reset()
+        #Information used to decide when stop the episode due agent random behavior
+        self.sim_info = {
+            "collision_counter":0,
+            "step_counter":0,
+            "dist_to_target":0.0,
+            "Truncate": False,
+            "reward_components":[],
+            "reward_names":[],
+            }
+        
+        #Log handlers
+        self.csv_file_path = csv_file_log
+        self._initialize_csv()
+        self.episode_log = []  # Store all steps during the episode
+        self.episode_id = 0  # Unique identifier for the episode where the agent reaches at least one target point
 
-    def _set_previous_states(self):
-        obs=self._get_obs()
-        #depth_image=self._get_depth_image()
-        self.start_position = obs["drone_position"]
-        self.previous_position=obs["drone_position"]
-        self.previous_altitude = float(self.start_position[2])
-        self.previous_velocity=obs["linear_velocity"]
-        #self.previous_min_depth, self.previous_perc_range = self._get_obstacle_proximity_features(depth_image)
-
+    #-------PATH Handler Functions      
+    #This function gets the new path for the next episode training
     def update_path(self):
         path = self.path_handler.get_next_path()
         print(f"Next Path selected:{path['path_id']}")
@@ -69,30 +69,90 @@ class QuadAirSimDroneEnv(AirSimEnv):
         self.target_position = np.array(point['target_position'],dtype=np.float32)
         self.start_position = np.array(point['start_position'],dtype=np.float32)
         self.max_distance= 3*np.linalg.norm(self.target_position - self.start_position)
+        self.previous_position=self.start_position
 
+    #this function gets the next target point in the current path for the drone reach
+    #return True if the current path is finished or False if there is still point in path
+    def update_points(self):
+        new_points=self.path_handler.get_next_point()    
+        if new_points is None:
+            return True
+        self.start_position = np.array(new_points['start_position'],dtype=np.float32)
+        self.target_position = np.array(new_points['target_position'],dtype=np.float32)
+        return False
+    
+    #### Auxiliary simulation functions
+    #setup the drone before the training of the agent begins
     def _setup_flight(self):
         self.client.reset()
         self.client.enableApiControl(True)
         self.client.armDisarm(True)
-        #self.client.takeoffAsync().join()
-        state = self.client.getMultirotorState()
+        
+        #state = self.client.getMultirotorState()
         #if state.landed_state == airsim.LandedState.Landed:
         x,y,z=float(self.start_position[0]),float(self.start_position[1]),float(self.start_position[2])
         self.client.moveToPositionAsync(x,y,z, 0.75*self.max_velocity).join()
-        self._set_previous_states()
+
+    #Display Simulation Info
+    def _show_sim_infos(self):
         
-    def reset(self, **kwargs):
-        if 'seed' in kwargs:
-            seed = kwargs['seed']
+        reward_str=''
+        rewards=self.sim_info["reward_components"]
+        if rewards[0]>0:
+           reward_str+=f"target close:{rewards[0]}|"
+        reward_str+=f"dist rwd:{rewards[1]}|"
+        reward_str+=f"displ rwd:{rewards[2]}|"
+        reward_str+=f"lidar pen:{rewards[3]}|"
+        reward_str+=f"colli pen:{rewards[4]}|"
+        print(reward_str)
+    
+    #Logger functions to track the success of training
+    def _initialize_csv(self):
+
+        # Create the CSV file with headers if it doesn't exist
+        if not os.path.exists(self.csv_file_path):
+            with open(self.csv_file_path, mode="w", newline="") as file:
+                writer = csv.writer(file)
+                writer.writerow([
+                    "Episode_ID","Path_ID", "Target_ID", 
+                    "Drone_Position_X", "Drone_Position_Y", "Drone_Position_Z", "Reward"
+                ])
+
+    def _log_step(self, obs, reward):
+        """Log data for the current step into the episode log."""
+        path_id = self.path_handler.paths[self.path_handler.current_path_index]["path_id"]
+        target_id = self.path_handler.current_point_index
+        drone_x, drone_y, drone_z = obs["drone_position"]
+
+        # Use the current `episode_id` if it's set; otherwise, use 0 (target not yet reached)
+        self.episode_log.append({
+            "Episode_ID": self.episode_id or 0,  # 0 until the target is reached
+            "Path_ID": path_id,
+            "Target_ID": target_id,
+            "Drone_Position_X": drone_x,
+            "Drone_Position_Y": drone_y,
+            "Drone_Position_Z": drone_z,
+            "Reward": reward
+        })
+        #update the next episode id
         
-        # Reset environment and set to start position
-        self.collision_counter=0
-        self.step_count=0
-        self.update_path()
-        self._setup_flight()
-        # Get initial observation
-        return self._get_obs(), {}
-        
+        #writes the current episode where the drone reached the target into the csv file
+    
+    def _log_episode_to_csv(self):
+        """Write all logged steps in the episode to the CSV file."""
+        # Update all rows in the episode log to use the finalized
+        for row in self.episode_log:
+            row["Episode_ID"] = self.episode_id
+
+        with open(self.csv_file_path, mode="a", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=[
+                "Episode_ID","Path_ID", "Target_ID", 
+                "Drone_Position_X", "Drone_Position_Y", "Drone_Position_Z", "Reward"
+            ])
+            writer.writerows(self.episode_log)
+        self.episode_log = []  # Clear the log for the next episode
+
+    ###### Auxiliary Component Reward Functions
     def get_euler_angles(self, quaternion):
         # Convert quaternion to Euler angles (roll, pitch, yaw)
         rotation = R.from_quat([quaternion.x_val, quaternion.y_val, quaternion.z_val, quaternion.w_val])
@@ -109,54 +169,64 @@ class QuadAirSimDroneEnv(AirSimEnv):
         relative_yaw = (relative_yaw + np.pi) % (2 * np.pi) - np.pi
         return relative_yaw.astype(np.float32)
 
-    def _get_depth_image(self):
-        # Get depth image from AirSim
-        responses = self.client.simGetImages([airsim.ImageRequest("front_center", airsim.ImageType.DepthPerspective, True, False)])
-        depth_img = responses[0]
-        depth_data = airsim.list_to_2d_float_array(depth_img.image_data_float, depth_img.height, depth_img.width)
-        depth_data = (255.0 * depth_data / np.max(depth_data)).astype(np.uint8)  # Normalize
-        return cv2.resize(depth_data, (self.img_shape[0], self.img_shape[1]))
+    def parse_lidarData(self, data):
+        # reshape array of floats to array of [X,Y,Z]
+        points = np.array(data, dtype=np.dtype('f4'))
+        points = np.reshape(points, (int(points.shape[0]/3), 3))
+        return points
 
-    def _get_obstacle_proximity_features(self, depth_image):
-        # Remove the last dimension if the image has it (e.g., shape [H, W, 1])
-        #depth_image = np.squeeze(depth_image, axis=-1)
-        # Get image dimensions
-        h, w = depth_image.shape
-        # Define cropping region for the central portion (e.g., 50% of height and width)
-        crop_height = int(h * 0.5)
-        crop_width = int(w * 0.5)
-        start_y = (h - crop_height) // 2
-        start_x = (w - crop_width) // 2
+    def parse_flattened_obs(self,flattened_obs):
+        """
+        Convert a flattened observation array back into a dictionary.
+
+        Args:
+            flattened_obs (np.ndarray): Flattened observation array.
+
+        Returns:
+            dict: Parsed observation with keys for drone_position, orientation, linear_velocity, and relative_yaw.
+        """
+        # Indices for splitting the flattened observation
+        position_end = 3  # First 3 elements are drone position
+        orientation_end = position_end + 3  # Next 3 elements are orientation (roll, pitch, yaw)
+        velocity_end = orientation_end + 3  # Next 3 elements are linear velocity
         
-        # Crop the central portion of the depth image
-        central_depth_image = depth_image[start_y:start_y + crop_height, start_x:start_x + crop_width]
-        #print("central depth image")
-        #print(central_depth_image)
-        # 1. Minimum Depth Value in the central portion (nearest obstacle)
-        min_depth = np.min(central_depth_image)
 
-        # 2. Quadrant-Based Minimum Depths within the cropped region
-        #ch, cw = central_depth_image.shape
-        #quadrants = [
-        #    central_depth_image[:ch//2, :cw//2],     # Top-left
-        #    central_depth_image[:ch//2, cw//2:],     # Top-right
-        #    central_depth_image[ch//2:, :cw//2],     # Bottom-left
-        #    central_depth_image[ch//2:, cw//2:],     # Bottom-right
-        #]
-        #quadrant_depths = [np.min(quad) for quad in quadrants]
+        # Parse data
+        drone_position = flattened_obs[:position_end]
+        orientation = flattened_obs[position_end:orientation_end]
+        linear_velocity = flattened_obs[orientation_end:velocity_end]
+        lidar_points=flattened_obs[velocity_end:]
 
-        # 3. Percentage of pixels within 90% of the minimum value
-        threshold = min_depth * 1.05  # 95% of minimum value (min_depth + 10%)
-        pixels_within_range = np.sum(central_depth_image <= threshold)
-        total_pixels = central_depth_image.size
-        percentage_within_range = (pixels_within_range / total_pixels) * 100
+        # Construct the dictionary
+        parsed_obs = {
+            "drone_position": drone_position,
+            "orientation": orientation,
+            "linear_velocity": linear_velocity,
+            "lidar_points":lidar_points
+        }
 
-        return min_depth, percentage_within_range
+        return parsed_obs
+
+
+    ### Fundamental Functions for the Enviroment and Agent
+
+    def __del__(self):
+        print("del called")
+        self.client.reset()
+
+    def reset(self, **kwargs):
+        if 'seed' in kwargs:
+            seed = kwargs['seed']
+        
+        # Reset environment and set to start position
+        self.sim_info['collision_counter']=0
+        self.sim_info['step_counter']=0
+        self.update_path()
+        self._setup_flight()
+        # Get initial observation
+        return self._get_obs(), {}
 
     def _get_obs(self):
-        # Get depth image and resize
-        #depth_image = self._get_depth_image()
-        #depth_image = np.expand_dims(depth_image, axis=-1)
         # Get drone's current position, orientation, linear velocity
         drone_state = self.client.getMultirotorState()
         drone_position = drone_state.kinematics_estimated.position
@@ -170,323 +240,191 @@ class QuadAirSimDroneEnv(AirSimEnv):
         linear_velocity = drone_state.kinematics_estimated.linear_velocity
         current_velocity = np.array([linear_velocity.x_val, linear_velocity.y_val, linear_velocity.z_val],dtype=np.float32)
 
-        # Relative distance to target (component-wise difference)
-        #relative_distance = self.target_position - current_position
-
-        # Relative yaw to face the target
-        current_yaw = orientation_euler[2]  # Extract the yaw angle
-        relative_yaw = self._get_relative_yaw_to_target(current_position, current_yaw)
+                
         drone_orientation=np.array(orientation_euler,dtype=np.float32)
         
-        self.drone_orientation=drone_orientation
-        return {
-            #"depth_image": depth_image,
-            "drone_position": current_position,
-            #"target_position": self.target_position,
-            "orientation": drone_orientation,  # roll, pitch, yaw
-            "linear_velocity": current_velocity,
-            #"relative_distance": relative_distance,
-            "relative_yaw": np.array([relative_yaw]),  # Yaw difference to align with the target
-        }
+        lidar_data = self.client.getLidarData()
+        lidar_points=np.zeros(LIDAR_FEAT_SIZE,dtype=np.float32)
+        size_lidar_read=len(lidar_data.point_cloud)
+        if size_lidar_read > LIDAR_FEAT_SIZE:        
+            lidar_points[:] = np.array(lidar_data.point_cloud[:LIDAR_FEAT_SIZE], dtype=np.float32)
+        elif size_lidar_read > 3:
+            lidar_points[:size_lidar_read]=np.array(lidar_data.point_cloud[:], dtype=np.float32)
+        return np.concatenate([
+            current_position,  # Position (x, y, z)
+            drone_orientation,  # Orientation (roll, pitch, yaw)
+            current_velocity,  # Linear velocity (vx, vy, vz)
+            lidar_points,
+        ])
 
-    def parse_lidarData(self, data):
-        # reshape array of floats to array of [X,Y,Z]
-        points = np.array(data.point_cloud, dtype=np.dtype('f4'))
-        points = np.reshape(points, (int(points.shape[0]/3), 3))
-        return points
-
-    def _compute_reward(self, obs):
-        # Initialize done flag
-        done = False
-
-        # Calculate distance to target
-        drone_position, current_velocity, relative_yaw = obs["drone_position"], obs["linear_velocity"], obs["relative_yaw"]
-        distance_to_target = np.linalg.norm(drone_position - self.target_position)
-        delta = 1 if self.previous_distance_to_target - distance_to_target > 0 else -1
-        distance_reward = 100 * delta
-        self.previous_distance_to_target = distance_to_target
-        
-
-        ##### This reward tries to incentivize the drone movement in its camera-facing position
-        orientation = obs["orientation"]  # Assuming the drone's orientation is provided in roll, pitch, yaw
-        yaw = orientation[2]  # Extract yaw in radians
-        facing_direction = np.array([np.cos(yaw), np.sin(yaw), 0])  # Facing direction vector in X-Y plane
-        # Calculate movement direction based on positions
-        movement_direction = drone_position - self.previous_position
-        if np.linalg.norm(movement_direction) > 1e-6:  # Avoid division by zero
-            movement_direction /= np.linalg.norm(movement_direction)  # Normalize
-        else:
-            movement_direction = np.zeros_like(movement_direction)
-        # Check alignment between movement and facing direction
-        alignment = np.dot(facing_direction[:2], movement_direction[:2])  # Consider only X-Y plane for alignment
-        alignment_reward = 0
-        if alignment > 0.8:  # Movement is closely aligned with the facing direction
-            print("Movement in direction of camera")
-            alignment_reward = 50  # Positive reward for aligned movement
-            if delta > 0:
-                distance_reward*=1.5 #bonus in case the movement was in the direction of the camera facing and the distance was reduced
-        elif alignment < 0.5:
-            alignment_reward = -30
-        # Update the previous position for the next step
-        
-        
-
-        # Penalty for larger changes in Z altitude
-        altitude_change = abs(drone_position[2] - self.previous_altitude)
-        altitude_penalty = -3 * altitude_change  # Scale the penalty as needed
-        
-        
-
-        # Calculate the misalignment change and update the previous yaw
-        yaw_penalty = -2 * abs(relative_yaw) if abs(relative_yaw) > np.pi / 2 else -abs(relative_yaw)
-        
-
-        # Reward for moving away from the nearest obstacle
-        depth_image = self._get_depth_image()
-        min_depth, perc_range_obstacle = self._get_obstacle_proximity_features(depth_image)
-        obstacle_reward = 0
-        if min_depth < self.prox_tresh:  # This indicates that drone is close to some obstacle
-            if perc_range_obstacle > 0.9:  # The main portion of the central image is occupied by an obstacle
-                yaw_penalty *= 0.1  # Downscale the yaw misalignment penalty temporarily
-                self.previous_perc_range = perc_range_obstacle
-                #print("drone very close to obstacle")
-            if self.previous_perc_range > 0.9 and self.previous_perc_range > perc_range_obstacle:
-                print("obstacle reward achieved")
-                obstacle_reward = 30
-            
-        
-
-        # Smooth movement penalty for excessive velocity changes
-        velocity_change_penalty = -np.linalg.norm(current_velocity - self.previous_velocity)
-        
-        
-
-        # Collision penalty
-        collision = self.client.simGetCollisionInfo().has_collided
-        collision_penalty = 0
-        if collision:
-            self.collision_counter += 1
-            print(f"collision counter:{self.collision_counter}")
-            collision_penalty = -1e3 * self.collision_counter
-        
-
-        # Terminate the episode if too many collisions
-        done = True if self.collision_counter > 1000 else False
-
-        # Time penalty to encourage faster completion
-        time_penalty = -0.1 * distance_to_target
-        
-
-        # Proximity bonus
-        proximity_bonus = 0
-        if distance_to_target < 5.0:
-            proximity_bonus = 1e3
-            if distance_to_target < 1.5:
-                proximity_bonus = 1e6
-                done = True
-        print(f"Proximity Bonus: {proximity_bonus}")
-
-        self.previous_altitude = drone_position[2]
-        self.previous_position = drone_position
-        self.previous_velocity = current_velocity
-
-        # Combine all rewards and penalties with appropriate scaling
-        reward = (
-            distance_reward +
-            yaw_penalty +
-            obstacle_reward +
-        #    velocity_change_penalty +
-            proximity_bonus +
-            alignment_reward +
-            altitude_penalty +
-            collision_penalty +
-            time_penalty
-        )
-        #print(f"Total:{reward} | distance:{distance_reward} | yaw pen:{yaw_penalty} | obstacle:{obstacle_reward}")
-        #print(f"velocity:{velocity_change_penalty} |proximity:{proximity_bonus} |alignment:{alignment_reward}")
-        #print(f"altitude pen:{altitude_penalty} | collision pen:{collision_penalty} | time: {time_penalty}")
-        print(f"Total Reward: {reward}")
-        print("######################")
-
-        return float(reward), done, distance_to_target
-
-    def new_reward(self,obs):
+    def _compute_reward(self,obs):
         done=False
         # Extract required observation data
         drone_position = obs["drone_position"]
         previous_position = self.previous_position
         target_position = self.target_position
-        lidar_data = self.client.getLidarData()
+        #lidar_data = self.client.getLidarData()
         
         # Initialize rewards and penalties
         close_target_reward=0.0 #(a): range 0 or 1
         dist_reward=0
-        direction_reward=0.0 #(b): range[-1, 1]
         displacement_reward = 0.0 #(c): range 0 or 0.5
-        yaw_reward=0 #(d): range 0 or [2/3,1]
-        foward_reward =0.0 #(e): range [-1, 1]
-        lidar_reward = 0 #(f): range[0,1] based on the percentage of distances above the threshold
-        lidar_penalty = 0 # (g): range[0,1] based on the percentage of distances below the threshold
-        collision_penalty = 0
+        lidar_penalty = 0.0 # (g): range[0,1] based on the percentage of distances below the threshold
+        collision_penalty = 0.0
         
         ##weights for each component of reward based on distance to target
-        displ_weight=0.2
-        yaw_weight=0.1
-        forward_weight=0.05
-        lidar_pen_weight=0.3
+        displ_weight=0.1
+        lidar_pen_weight=0.25
 
         # ---- 1. Distance Based ----
         #(a)----- proximity reward based on current distance from target
         dist_target = np.linalg.norm(target_position-drone_position)
         dist_reward=-dist_target
-        if dist_target < 3:
-            close_target_reward=1e2
-            if dist_target < 1:
+        if dist_target < 5:
+            close_target_reward=1e3
+            if dist_target < 3:
                 close_target_reward=1e6
                 done=True
         else:
             close_target_reward=0
 
-        #(b)-----  Scalar product reward for movement in the target direction
-        movement_vector = drone_position - previous_position
-        prev_dist_vector = target_position - previous_position
-        # Normalize vectors to calculate scalar product
-        if np.linalg.norm(movement_vector) > 0 and np.linalg.norm(prev_dist_vector) > 0:
-            movement_vector_normalized = movement_vector / np.linalg.norm(movement_vector)
-            prev_distance_vector_normalized = prev_dist_vector / np.linalg.norm(prev_dist_vector)
-            direction_reward = np.dot(movement_vector_normalized, prev_distance_vector_normalized)
-    
+         
         #(c)-----  Reward based on the displacement
-        previous_distance_to_target = np.linalg.norm(self.previous_position - target_position)
+        previous_distance_to_target = np.linalg.norm(previous_position - target_position)
         current_distance_to_target = np.linalg.norm(drone_position - target_position)
         delta_displacement= previous_distance_to_target - current_distance_to_target
         displacement_reward= displ_weight*dist_target if delta_displacement > 0 else 0
         
-        #(d)-----  Drone yaw alignment reward, measures if the drone is aligned with the target
-        relative_yaw=obs["relative_yaw"]
-        #yaw_reward= (np.pi-abs(relative_yaw))/np.pi if -(np.pi/3) <= relative_yaw <= (np.pi/3) else 0
-        yaw_reward= yaw_weight*dist_target if -(np.pi/3) <= relative_yaw <= (np.pi/3) else 0
-    
-        #(e)-----  This reward tries to incentivize the drone movement in its camera-facing position
-        orientation = obs["orientation"]  # Assuming the drone's orientation is provided in roll, pitch, yaw
-        yaw = orientation[2]  # Extract yaw in radians
-        facing_direction = np.array([np.cos(yaw), np.sin(yaw), 0])  # Facing direction vector in X-Y plane
-        # Calculate movement direction based on positions
-        movement_vector_norm = np.zeros_like(movement_vector)
-        if np.linalg.norm(movement_vector) > 1e-6:  # Avoid division by zero
-            movement_vector_norm = movement_vector/np.linalg.norm(movement_vector)  # Normalize
-            
-        # Check alignment between movement and facing direction
-        dot_prod_foward = np.dot(facing_direction[:2], movement_vector_norm[:2])  # Consider only X-Y plane for alignment
-        foward_reward = forward_weight*dist_target if dot_prod_foward > 0.5 else 0
-
+             
 
         # ---- 2. LiDAR Based ----
         # Parse LiDAR data into 3D point cloud
-        if len(lidar_data.point_cloud) < 3:
-            lidar_points = np.empty((0, 3))  # No points received, empty array
-        else:
-            lidar_points = self.parse_lidarData(lidar_data)
-
-        if lidar_points.size > 0:
-            # (a) Reward for open spaces in front
+        lidar_points=obs["lidar_points"]
+        check_lidar=np.any(lidar_points!=0)
+        lidar_points=self.parse_lidarData(lidar_points)
+        if check_lidar:
             distances_to_points = np.linalg.norm(lidar_points, axis=1)
-            front_area_indices = lidar_points[:, 0] > 0  # Points in front of the drone
-            front_distances = distances_to_points[front_area_indices]
-
-            if len(front_distances) > 0:
-                average_front_distance = np.mean(front_distances)
-                #if the current mean distance is bigger than the minimum threshold apply reward based on how many distances above the mean are in the front of the drone
-                #(f) -------- Reward for movement in wide open space
-                if average_front_distance > self.min_dist_obs:
-                    above_mean_count = np.sum(front_distances > average_front_distance*0.9)
-                    # Calculate the percentage of distances above the mean
-                    lidar_reward = 50*(above_mean_count / len(front_distances))
-                # (g)------ Penalty for proximity to obstacles        
-                if average_front_distance <= self.min_dist_obs * 1.1:                    
-                    below_mean_count = np.sum(front_distances < average_front_distance)
-                    # Calculate the percentage of distances above the mean
-                    #lidar_penalty = 50*(below_mean_count / len(front_distances))
-                    lidar_penalty = -lidar_pen_weight*dist_target
-        
-
+            average_distance = np.mean(distances_to_points)                
+            #penalty for proximity with obstacles
+            if average_distance < self.min_dist_obs * 1.1:
+                #print("Close to obstacle")                   
+                lidar_penalty = -lidar_pen_weight*dist_target
          # ---- 3. Collision Penalty ----
         collision = self.client.simGetCollisionInfo().has_collided
         if collision:
-            self.collision_counter+=1
-            collision_penalty = -(0.5*dist_target+1e2)*np.log(self.collision_counter)
+            
+            self.sim_info['collision_counter']+=1
+            collision_counter=self.sim_info['collision_counter']
+            print(f"collision: {collision_counter}")
+            collision_penalty = -(0.5*dist_target+1e2)*np.log(collision_counter)
             
 
         
+        time_penalty = -0.01 * self.sim_info['step_counter']
+
         total_reward = ( 
             close_target_reward+
             dist_reward+
             displacement_reward+
-            #yaw_reward+
-            #foward_reward+
             lidar_penalty+
-            collision_penalty
+            collision_penalty+
+            time_penalty
         )
         
             
         total_reward = float(total_reward)
-
-        print(f"Dist reward:{dist_reward} | disp rwd:{displacement_reward} | yaw rwd:{yaw_reward}")
-        print(f"foward rwd:{foward_reward} | lidar pen:{lidar_penalty} | colision pen:{collision_penalty}")
-        print(f"----- Total Reward: {total_reward}")
-        print("#######")
-
+        #update the simulation information for logs or truncate the episode
+        self.sim_info['reward_components']=[close_target_reward,dist_reward,displacement_reward,lidar_penalty,collision_penalty,time_penalty]
+        self.sim_info['reward_names']=['close_target_reward','dist_reward','displacement_reward','lidar_penalty','collision_penalty','time_penalty']
+        self.sim_info['dist_to_target']=dist_target
 
         # Update state for next reward calculation
         self.previous_position = drone_position
 
-        return total_reward, done, dist_target
+        return total_reward, done
     
+    def interpret_action(self, action):
+        """
+        Interpret discrete action into velocity and yaw commands.
+        Actions:
+        0: Hover
+        1: Move Forward
+        2: Move Backward
+        3: Move Right
+        4: Move Left
+        5: Rotate Right (90 degrees)
+        6: Rotate Left (90 degrees)
+        """
+        angle=45
+        vx, vy, vz = 0.0, 0.0, 0.0
+        yaw_action = None
+
+        if action == 0:  # Hover
+            pass  # No movement
+        elif action == 1:  # Move Forward
+            vx = -self.max_velocity
+            vz=self.max_velocity
+        elif action == 2:  # Move Backward
+            vx = self.max_velocity
+            vz=self.max_velocity
+        elif action == 3:  # Move Right
+            vy = -self.max_velocity
+            vz=self.max_velocity
+        elif action == 4:  # Move Left
+            vy = self.max_velocity
+            vz=self.max_velocity
+        elif action == 5:  # Rotate Right (90 degrees)
+            yaw_action= angle
+            #yaw_action = np.degrees(self.drone_orientation[2] + np.pi / 2)  # Add 90 degrees
+        elif action == 6:  # Rotate Left (90 degrees)
+            yaw_action=-angle
+            #yaw_action = np.degrees(self.drone_orientation[2] - np.pi / 2)  # Subtract 90 degrees
+
+        return vx, vy, vz, yaw_action
+
+
     def _do_action(self,action):
-        # Scale action values to the desired range
-        vx = float(action[0] *0.5*self.max_velocity)
-        vy = float(action[1] *0.5*self.max_velocity)
-        vz = float(action[2] *0.05* self.max_velocity)
-        delta_yaw_target_rad = float(action[3]) * np.radians(self.max_yaw_rate)  # Max yaw rate change in degrees per step
-        # Convert yaw_angle to degrees for AirSim
-        new_yaw_target_rad = self.drone_orientation[2] + delta_yaw_target_rad
-        new_yaw_target_rad = (new_yaw_target_rad + np.pi) % (2 * np.pi) - np.pi
-        yaw_action = np.degrees(new_yaw_target_rad)#gets the current drone orientation and sums the delta rad to align with the target an then transforms to degree to use in airsim
-        print(f"Yaw:{yaw_action}")
-        yaw_mode = airsim.YawMode(is_rate=False, yaw_or_rate=float(yaw_action))
-        self.client.moveByVelocityAsync(vx, vy, vz, duration=1, yaw_mode=0).join()
-
-        #self.client.rotateByYawRateAsync(yaw_rate,duration=0.5).join()
-        #self.client.moveByVelocityAsync(c_vx+a_vx,c_vy+a_vy,c_vz+a_vz,duration=0.5).join()
-
-    def update_points(self):
-        new_points=self.path_handler.get_next_point()    
-        if new_points is None:
-            return True
-        self.start_position = np.array(new_points['start_position'],dtype=np.float32)
-        self.target_position = np.array(new_points['target_position'],dtype=np.float32)
-        return False
-
+        vx, vy, vz, yaw_action = self.interpret_action(action)
+        act_time=0.5
+        if yaw_action is not None:  # Rotation
+            self.client.rotateByYawRateAsync(yaw_rate=yaw_action,duration=act_time).join()
+        else:  # Movement in the XY plane
+            self.client.moveByVelocityAsync(0.3*vx, 0.3*vy, 0*vz,duration=act_time).join()
+    
     def step(self, action):
         done_point,done_path=False, False
-        self.step_count+=1
-
+        self.sim_info["step_counter"]+=1
+        step_count=self.sim_info["step_counter"]
         self._do_action(action)
         # Get new state and compute reward
-        obs = self._get_obs()
-        print(f"Step: {self.step_count}")
-        reward, done_point,dist_target = self.new_reward(obs)
+        vec_obs=self._get_obs()
+        obs = self.parse_flattened_obs(vec_obs)
         
+        reward, done_point = self._compute_reward(obs)
+        #insert the current observation and reward into the current list in case the drone reaches the target in the current episode
+        self._log_step(obs,reward)
+        #it means that the drone reached the target position
         if done_point:
+            #writes the current log into csv file
+            self._log_episode_to_csv()
             done_path=self.update_points()
         
         terminated = True if done_path else False # Finish the current episode in case all the points in the path were used
         # Truncate if reward drops below threshold
-        truncated = True if self.collision_counter > 200 or  dist_target>self.max_distance  else False
-        if truncated:
+        truncated=False
+        if self.sim_info["collision_counter"] > 100 or step_count > 500 or  self.sim_info["dist_to_target"] > self.max_distance:
+            truncated=True
             print("Episode Truncated")
-        return obs, reward, terminated, truncated, {}
+        
+        #updates the current episode id
+        if terminated or truncated:
+            self.episode_id+=1
+        
+            
+            
+        return vec_obs, reward, terminated, truncated, {}
 
     def close(self):
+        print("Close Called")
         self.client.armDisarm(False)
         self.client.enableApiControl(False)
