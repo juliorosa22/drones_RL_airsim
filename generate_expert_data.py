@@ -5,7 +5,7 @@ from scipy.spatial.transform import Rotation as R
 import numpy as np
 import pandas as pd
 import time
-LIDAR_FEAT_SIZE=300
+LIDAR_FEAT_SIZE=600
 class ExpertDataCollector:
     def __init__(self, ip_address, csv_file,path_file,enabled_drone=True):
         
@@ -13,21 +13,17 @@ class ExpertDataCollector:
         self.path_handler=PathHandler(path_file)
         self.min_dist=2
         self.max_vel=10
+        self.target_pos=np.zeros(3,dtype=np.float32)
         self.client = airsim.MultirotorClient(ip=ip_address)
+        self.expert_points=[]
+        self.expert_actions=[]
+        
         if enabled_drone:
             self.client.confirmConnection()
             
     
     def parse_flattened_obs(self,flattened_obs):
-        """
-        Convert a flattened observation array back into a dictionary.
-
-        Args:
-            flattened_obs (np.ndarray): Flattened observation array.
-
-        Returns:
-            dict: Parsed observation with keys for drone_position, orientation, linear_velocity, and relative_yaw.
-        """
+    
         # Indices for splitting the flattened observation
         position_end = 3  # First 3 elements are drone position
         orientation_end = position_end + 3  # Next 3 elements are orientation (roll, pitch, yaw)
@@ -37,15 +33,15 @@ class ExpertDataCollector:
         # Parse data
         drone_position = flattened_obs[:position_end]
         orientation = flattened_obs[position_end:orientation_end]
-        linear_velocity = flattened_obs[orientation_end:velocity_end]
-        lidar_points=flattened_obs[velocity_end:]
+        target_position = flattened_obs[orientation_end:velocity_end]
+        lidar_distances=flattened_obs[velocity_end:]
 
         # Construct the dictionary
         parsed_obs = {
             "drone_position": drone_position,
             "orientation": orientation,
-            "linear_velocity": linear_velocity,
-            "lidar_points":lidar_points
+            "target_position": target_position,
+            "lidar_distances":lidar_distances
         }
 
         return parsed_obs
@@ -72,18 +68,65 @@ class ExpertDataCollector:
             self.client.moveToPositionAsync(x,y,z, 0.75*5).join()
             time.sleep(2)
 
+    def safe_move(self,vel_vec,z_fixed,act_time):
+        vx = vel_vec[0]
+        vy=vel_vec[1]
+        #self.client.moveToPositionAsync(float(drone_position[0]),float(drone_position[1]),float(z_fixed),0.75*self.max_vel)
+        self.client.moveByVelocityAsync(float(vx), float(vy), 0,duration=act_time).join()
+        drone_state = self.client.getMultirotorState()
+        state_pos = drone_state.kinematics_estimated.position
+        current_z = float(state_pos.z_val)
+        while current_z < 1.3*z_fixed:
+            #print("correcting z")
+            self.client.moveByVelocityAsync(0, 0, 0.03*self.max_vel,duration=act_time).join()
+            drone_state = self.client.getMultirotorState()
+            state_pos = drone_state.kinematics_estimated.position
+            current_z = float(state_pos.z_val)
+            #print(f"{current_z}")
+    
+    
+    def check_lidar_safe(self,obs,drone_ground,avoid_obs):
+        z_fixed=-5
+        distances_to_points = obs["lidar_distances"]
+        average_distance = np.mean(distances_to_points)
+        collision = self.client.simGetCollisionInfo().has_collided
+        action_change=False
+        while average_distance < self.min_dist *1.5 or collision:
+            action_change=True
+            #print(f"Close to target: {average_distance}")
+            id,action=self.get_action("backward")
+            drone_ground+=action[:-1]
+            x,y,_=drone_ground[:]
+            self.client.moveToPositionAsync(float(x),float(y),z_fixed,5).join()
+            self.expert_points.append(np.concatenate([obs["drone_position"],obs["orientation"],self.target_pos,distances_to_points]))
+            self.expert_actions.append(id)            
+            
+            
+            id,action=self.get_action(avoid_obs)
+            #print(f"id:{id} | action:{action}")
+            drone_ground+=action[:-1]
+            x,y,_=drone_ground[:]
+            self.client.moveToPositionAsync(float(x),float(y),z_fixed,5).join()
+            obs_vec=self._get_obs()
+            obs = self.parse_flattened_obs(np.copy(obs_vec))
 
+            distances_to_points = obs["lidar_distances"]
+            average_distance = np.mean(distances_to_points)
+            collision = self.client.simGetCollisionInfo().has_collided
 
-    def run_expert(self):
+        return action_change,drone_ground            
+
+    def run_new_expert(self):
         # Example: Scripted expert behavior
-        act_time=5.0
+        act_time=0.5
         perc_vel=0.3
+        z_fixed=-5.0
         move_away='left'
         move_close='right'
         allow_collision=False
-        expert_points=[]
-        expert_actions=[]
+        
         collision_count=0
+        hover_count=0
         for i in range(len(self.path_handler.paths)):
             path=self.path_handler.get_next_path()
             point=self.path_handler.get_next_point()
@@ -92,86 +135,142 @@ class ExpertDataCollector:
             while point is not None:
                 start_pos=np.array(point['start_position'],dtype=np.float32)
                 target_pos=np.array(point['target_position'],dtype=np.float32)
-                drone_pos=np.copy(start_pos)
-                
-                while abs(drone_pos[0] - target_pos[0]) > 2:  
+                drone_pos_ground=np.copy(start_pos)
+                print(f"start:{start_pos} | target: {target_pos}")
+                self.target_pos=np.copy(target_pos)
+                while abs(drone_pos_ground[0] - target_pos[0]) > 1:  
+                    #print("1 While")
                     obs_vec=self._get_obs()
                     obs=self.parse_flattened_obs(np.copy(obs_vec))
-                    drone_pos = obs["drone_position"]
-                    lidar_points=obs["lidar_points"]
-                    lidar_points=self.parse_lidarData(lidar_points)
-                    distances_to_points = np.linalg.norm(lidar_points, axis=1)
-                    average_distance = np.mean(distances_to_points)
-                    collision = self.client.simGetCollisionInfo().has_collided                
+                    drone_pos = obs["drone_position"]                    
                     id,action=self.get_action("forward")
-                    if average_distance < self.min_dist *1.1 or collision and allow_collision:
-                        collision_count +=1 
-                        id,action=self.get_action("backward")
-                        action=np.array(action,dtype=np.float32)
-                        if collision_count >10:
-                            break
-                    v_vec=action[:-1]*self.max_vel*perc_vel
-                    vx,vy,vz=v_vec[:]
-                    self.client.moveByVelocityAsync(float(vx), float(vy), 0,duration=act_time).join()
-                    expert_points.append(obs_vec)
-                    expert_actions.append(id)
+                    action_changed,drone_pos_ground=self.check_lidar_safe(obs,np.copy(drone_pos_ground),move_away)
+                    if action_changed:
+                        print("change in action")
+                        break                    
+                    
+                    drone_pos_ground+=action[:-1]
+                    x,y,_= drone_pos_ground[:]
+                    #print(f"x:{x} | y: {y}")
+                    self.client.moveToPositionAsync(float(x),float(y),z_fixed,5).join()
+                    self.expert_points.append(obs_vec)
+                    self.expert_actions.append(id)
                         
-                       ## 
+                        
                 #Movement to deslocate from the current initial position
                 delta_pos=10 if move_away =='left' else -10
                         
-                while abs(drone_pos[1] - (start_pos[1]+delta_pos)) > 2:
-                    #print("2 while")
-                    #print(f"{abs(drone_pos[1] - start_pos[1]+delta_pos)}")
-                    obs_vec=self._get_obs()
-                    obs=self.parse_flattened_obs(np.copy(obs_vec))
-                    drone_pos = obs["drone_position"]
-                    id,action=self.get_action(move_away)
-                    action=np.array(action,dtype=np.float32)
-                    v_vec=action[:-1]*self.max_vel*perc_vel
-                    vx,vy,vz=v_vec[:]
-                    self.client.moveByVelocityAsync(float(vx), float(vy), 0,duration=act_time).join()
-                    expert_points.append(obs_vec)
-                    expert_actions.append(id)
                     
+                if move_away=="right":
+                    while drone_pos_ground[1] > (start_pos[1]+delta_pos):
+                        #print("4 while")
+                        obs_vec=self._get_obs()
+                        obs=self.parse_flattened_obs(np.copy(obs_vec))
+                        drone_pos = obs["drone_position"]
+                        id,action=self.get_action(move_away)
+                        action_changed,drone_pos_ground=self.check_lidar_safe(obs,drone_pos_ground,move_away)
+                        if not action_changed:
+                            drone_pos_ground+=action[:-1]
+                            x,y,_= drone_pos_ground[:]
+                            self.client.moveToPositionAsync(float(x),float(y),z_fixed,5).join()
+                            self.expert_points.append(obs_vec)
+                            self.expert_actions.append(id)
+                    
+                    
+                else:
+                    while drone_pos_ground[1] < (start_pos[1]+delta_pos):
+                        #print("4 while")
+                        obs_vec=self._get_obs()
+                        obs=self.parse_flattened_obs(np.copy(obs_vec))
+                        drone_pos = obs["drone_position"]
+                        id,action=self.get_action(move_away)
+                        action_changed,drone_pos_ground=self.check_lidar_safe(obs,drone_pos_ground,move_away)
+                        if not action_changed:
+                            drone_pos_ground+=action[:-1]
+                            x,y,_= drone_pos_ground[:]
+                            self.client.moveToPositionAsync(float(x),float(y),z_fixed,5).join()
+                            self.expert_points.append(obs_vec)
+                            self.expert_actions.append(id)
+                    move_away='left'
+                    move_close='right'
+
+
+
                 # movement to approximate to next target position
-                while abs(drone_pos[0] - target_pos[0]) > 2:
+                while drone_pos_ground[0] > target_pos[0] :
                     #print("3 while")
                     obs_vec=self._get_obs()
                     obs=self.parse_flattened_obs(np.copy(obs_vec))
                     drone_pos = obs["drone_position"]                      
                     id,action=self.get_action("forward")
                     action=np.array(action,dtype=np.float32)
-                    v_vec=action[:-1]*self.max_vel*perc_vel
-                    vx,vy,vz=v_vec[:]
-                    self.client.moveByVelocityAsync(float(vx), float(vy), 0,duration=act_time).join()
-                    expert_points.append(obs_vec)
-                    expert_actions.append(id)
+                    action_changed,drone_pos_ground=self.check_lidar_safe(obs,drone_pos_ground,move_close)
+                    if not action_changed:
+                        drone_pos_ground+=action[:-1]
+                        x,y,_= drone_pos_ground[:]
+                        self.client.moveToPositionAsync(float(x),float(y),z_fixed,5).join()
+                        #self.expert_points.append(obs_vec)
+                        #self.expert_actions.append(id)
+                    
                     
 
                 ##movement to close the drone y componet to target y component
-                while abs(drone_pos[1] - target_pos[1]) > 2:
-                    #print("4 while")
+                if move_close=="right":
+                    while drone_pos_ground[1] > target_pos[1]:
+                        #print("5 while")
+                        obs_vec=self._get_obs()
+                        obs=self.parse_flattened_obs(np.copy(obs_vec))
+                        drone_pos = obs["drone_position"]
+                        id,action=self.get_action(move_close)
+                        action=np.array(action,dtype=np.float32)
+                        #v_vec=action[:-1]*self.max_vel*perc_vel
+                        action_changed,drone_pos_ground=self.check_lidar_safe(obs,drone_pos_ground,move_close)
+                        if not action_changed:
+                            drone_pos_ground+=action[:-1]
+                            x,y,_= drone_pos_ground[:]
+                            self.client.moveToPositionAsync(float(x),float(y),z_fixed,5).join()
+                            self.expert_points.append(obs_vec)
+                            self.expert_actions.append(id)
+                    move_away='right'
+                    move_close='left'
+                    
+                else:
+                    while drone_pos_ground[1] < target_pos[1]:
+                        #print("6 while")
+                        obs_vec=self._get_obs()
+                        obs=self.parse_flattened_obs(np.copy(obs_vec))
+                        drone_pos = obs["drone_position"]
+                        id,action=self.get_action(move_close)
+                        action=np.array(action,dtype=np.float32)
+                       
+                        action_changed,drone_pos_ground=self.check_lidar_safe(obs,drone_pos_ground,move_close)
+                        if not action_changed:
+                            drone_pos_ground+=action[:-1]
+                            x,y,_= drone_pos_ground[:]
+                            self.client.moveToPositionAsync(float(x),float(y),z_fixed,5).join()
+                            self.expert_points.append(obs_vec)
+                            self.expert_actions.append(id)
+                    move_away='left'
+                    move_close='right'
+                ##hover in the actual target position before the next point
+                while hover_count < 30:
+                    hover_count+=1
                     obs_vec=self._get_obs()
                     obs=self.parse_flattened_obs(np.copy(obs_vec))
                     drone_pos = obs["drone_position"]
-                    id,action=self.get_action(move_close)
-                    action=np.array(action,dtype=np.float32)
-                    v_vec=action[:-1]*self.max_vel*perc_vel
-                    vx,vy,vz=v_vec[:]
-                    self.client.moveByVelocityAsync(float(vx), float(vy), 0,duration=act_time).join()
-                    expert_points.append(obs_vec)
-                    expert_actions.append(id)
-                    
-                allow_collision = not allow_collision
-            
+                    id,action=self.get_action("hover")
+                    action_changed,drone_pos_ground=self.check_lidar_safe(obs,drone_pos_ground,move_close)
+                    if not action_changed:
+                        drone_pos_ground+=action[:-1]
+                        x,y,_= drone_pos_ground[:]
+                        self.client.moveToPositionAsync(float(x),float(y),z_fixed,5).join()
+                        self.expert_points.append(obs_vec)
+                        self.expert_actions.append(id)
 
-                if move_close =='right':                            
-                    move_away='right'
-                    move_close='left'
-                else:
-                    move_away='left'
-                    move_close='right'
+                hover_count=0
+                collision_count=0
+                #allow_collision = not allow_collision
+            
 
                 point=self.path_handler.get_next_point()
             
@@ -179,16 +278,18 @@ class ExpertDataCollector:
 
         self.client.armDisarm(False)
         self.client.enableApiControl(False)
+        
         data = {
-            "observation": [xp_obs.tolist() for xp_obs in expert_points],  # Convert np.array to list
-            "action": expert_actions
+            "observation": [xp_obs.tolist() for xp_obs in self.expert_points],  # Convert np.array to list
+            "action": self.expert_actions
         }
-    
+        print(f"size action:{len(self.expert_actions)} | size obs:{len(self.expert_points)}")
         df = pd.DataFrame(data)
         # Save to CSV
         df.to_csv(self.csv_file, index=False)
         print(f"Expert data saved to {self.csv_file}")
 
+   
     def move_position(self,position,vel,act_time,error=0):
         next_position=vel[:-1]*act_time+position+error
         #print(f"position:{position}, next:{next_position}")
@@ -207,7 +308,7 @@ class ExpertDataCollector:
             return 5,np.array([0,0,0,1],np.float32)
         elif command == "rot_left":
             return 6,np.array([0,0,0,-1],dtype=np.float32)
-        else :
+        else :#hover
             return 0,np.array([0,0,0,0],dtype=np.float32)
 
     def get_euler_angles(self, quaternion):
@@ -232,6 +333,8 @@ class ExpertDataCollector:
                 
         drone_orientation=np.array(orientation_euler,dtype=np.float32)
         
+        
+        ## Lidar feature data
         lidar_data = self.client.getLidarData()
         lidar_points=np.zeros(LIDAR_FEAT_SIZE,dtype=np.float32)
         size_lidar_read=len(lidar_data.point_cloud)
@@ -239,11 +342,13 @@ class ExpertDataCollector:
             lidar_points[:] = np.array(lidar_data.point_cloud[:LIDAR_FEAT_SIZE], dtype=np.float32)
         elif size_lidar_read > 3:
             lidar_points[:size_lidar_read]=np.array(lidar_data.point_cloud[:], dtype=np.float32)
+        lidar_points=self.parse_lidarData(lidar_points)
+        lidar_distances = np.linalg.norm(lidar_points, axis=1)
         return np.concatenate([
             current_position,  # Position (x, y, z)
             drone_orientation,  # Orientation (roll, pitch, yaw)
-            current_velocity,  # Linear velocity (vx, vy, vz)
-            lidar_points,
+            self.target_pos,  # Linear velocity (vx, vy, vz)
+            lidar_distances,
         ])
 
     def _generate_expert_points(self):
@@ -253,7 +358,7 @@ class ExpertDataCollector:
         move_close='right'
         expert_points=[[] for i in range(len(self.path_handler.paths))]
         expert_actions=[[] for i in range(len(self.path_handler.paths))]
-
+        hover_count=0
         for i in range(len(self.path_handler.paths)):
             path=self.path_handler.get_next_path()
             point=self.path_handler.get_next_point()
@@ -271,7 +376,7 @@ class ExpertDataCollector:
                         id,action=self.get_action("forward")
                         #action=np.array(action,dtype=np.float32)
                         
-                        expert_points[i].append(np.copy(drone_pos))
+                        expert_points[i].append((np.copy(drone_pos),np.copy(target_pos)))
                         expert_actions[i].append(id)
                         #self.collect_data(drone_pos,action)
                         drone_pos+=action[:-1]#self.move_position(drone_pos,action*vel_step,1)
@@ -285,7 +390,7 @@ class ExpertDataCollector:
                     id,action=self.get_action(move_away)
                     #action=np.array(action,dtype=np.float32)
                     #self.collect_data(drone_pos,action)
-                    expert_points[i].append(np.copy(drone_pos))
+                    expert_points[i].append((np.copy(drone_pos),np.copy(target_pos)))
                     expert_actions[i].append(id)
                     drone_pos+=action[:-1]#self.move_position(drone_pos,action*vel_step,1)
                 # movement to approximate to next target position
@@ -294,7 +399,7 @@ class ExpertDataCollector:
                     id,action=self.get_action("forward")
                     #action=np.array(action,dtype=np.float32)
                     #self.collect_data(drone_pos,action)
-                    expert_points[i].append(np.copy(drone_pos))
+                    expert_points[i].append((np.copy(drone_pos),np.copy(target_pos)))
                     expert_actions[i].append(id)
                     drone_pos+=action[:-1]#self.move_position(drone_pos,action*vel_step,1)
 
@@ -303,10 +408,11 @@ class ExpertDataCollector:
                     #print("4 while")                      
                     id,action=self.get_action(move_close)
                     #action=np.array(action,dtype=np.float32)
-                    expert_points[i].append(np.copy(drone_pos))
+                    expert_points[i].append((np.copy(drone_pos),np.copy(target_pos)))
                     expert_actions[i].append(id)
                     drone_pos+=action[:-1]#self.move_position(drone_pos,action*vel_step,1)
                     
+
                 
                 if move_close =='right':                            
                     move_away='right'
@@ -330,11 +436,11 @@ class ExpertDataCollector:
         for path,action_path in zip(xp_points,xp_actions):
             self._setup_flight(path[0])
             #print(f"len:{len(path)}")
-            for position,action in zip(path,action_path):
+            for position,target,action in zip(path,action_path):
                 #print(f"moving to position {position}")
                 x,y,z=float(position[0]),float(position[1]),float(position[2])
-                self.client.moveToPositionAsync(x,y,z, 10).join()
-                obs=self._get_obs()
+                self.client.moveToPositionAsync(x,y,z, 5).join()
+                obs=self._get_obs(target)
                 print(obs.shape)
                 xp_obs.append(obs)
                 xp_act.append(action)
