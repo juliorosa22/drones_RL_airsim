@@ -116,7 +116,7 @@ class ExpertImitationEnv(gym.Env):
 
 #pre-training phase
 ip_client="127.0.0.1"
-collector = ExpertDataCollector(ip_address=ip_client, csv_file="expert_data_3.csv",path_file='training_paths.json',enabled_drone=False)
+collector = ExpertDataCollector(ip_address=ip_client, csv_file="expert_data_6.csv",path_file='training_paths.json',enabled_drone=False)
 #collector.generate_expert_obs()
 #collector.run_new_expert()
 run= True
@@ -131,9 +131,9 @@ if run:
     model = DQN("MlpPolicy", imitation_env,learning_rate=1e-3,verbose=1)
 
     # # # # # # # Pre-train the model using the expert data
-    model.learn(total_timesteps=len(observations) * 100)  # Train for multiple passes over the expert data
+    model.learn(total_timesteps=len(observations) * 200)  # Train for multiple passes over the expert data
 
     # # # # # # # Save the pre-trained model
-    model.save("pre_train_DQN_agent")
+    model.save("imitation_DQN_agent")
     print("model saved")
 

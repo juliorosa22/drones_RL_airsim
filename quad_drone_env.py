@@ -194,14 +194,14 @@ class QuadAirSimDroneEnv(AirSimEnv):
         # Parse data
         drone_position = flattened_obs[:position_end]
         orientation = flattened_obs[position_end:orientation_end]
-        linear_velocity = flattened_obs[orientation_end:velocity_end]
+        target_pos = flattened_obs[orientation_end:velocity_end]
         lidar_points=flattened_obs[velocity_end:]
 
         # Construct the dictionary
         parsed_obs = {
             "drone_position": drone_position,
             "orientation": orientation,
-            "linear_velocity": linear_velocity,
+            "target_pos": target_pos,
             "lidar_points":lidar_points
         }
 
@@ -253,7 +253,7 @@ class QuadAirSimDroneEnv(AirSimEnv):
         return np.concatenate([
             current_position,  # Position (x, y, z)
             drone_orientation,  # Orientation (roll, pitch, yaw)
-            current_velocity,  # Linear velocity (vx, vy, vz)
+            self.target_position,  # Linear velocity (vx, vy, vz)
             lidar_points,
         ])
 
@@ -308,8 +308,8 @@ class QuadAirSimDroneEnv(AirSimEnv):
             distances_to_points = np.linalg.norm(lidar_points, axis=1)
             average_distance = np.mean(distances_to_points)                
             #penalty for proximity with obstacles
-            if average_distance < self.min_dist_obs * 1.3:
-                #print("Close to obstacle")                   
+            if average_distance < self.min_dist_obs * 1.5:
+                print("Close to obstacle")                   
                 lidar_penalty = -lidar_pen_weight*dist_target
          # ---- 3. Collision Penalty ----
         collision = self.client.simGetCollisionInfo().has_collided
@@ -396,14 +396,18 @@ class QuadAirSimDroneEnv(AirSimEnv):
         drone_state = self.client.getMultirotorState()
         state_pos = drone_state.kinematics_estimated.position
         current_z = float(state_pos.z_val)
-        while current_z < 1.5*z_fixed:
-            print("down z")
+        count=0
+        while current_z < 1.5*z_fixed and count <5:
+            #print("down z")
+            count+=1
             self.client.moveByVelocityAsync(0, 0, 0.1*self.max_velocity,duration=act_time).join()
             drone_state = self.client.getMultirotorState()
             state_pos = drone_state.kinematics_estimated.position
             current_z = float(state_pos.z_val)
-        while current_z > 0.5*z_fixed:
-            print("up z")
+        count=0
+        while current_z > 0.5*z_fixed and count<5:
+            #print("up z")
+            count+=1
             self.client.moveByVelocityAsync(0, 0, -0.1*self.max_velocity,duration=act_time).join()
             drone_state = self.client.getMultirotorState()
             state_pos = drone_state.kinematics_estimated.position
