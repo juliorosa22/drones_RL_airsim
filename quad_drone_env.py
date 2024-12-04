@@ -33,7 +33,7 @@ class QuadAirSimDroneEnv(AirSimEnv):
         self.previous_velocity = np.zeros(3, dtype=np.float32)
         self.update_path()
         self._setup_flight()
-        
+        self.count_proximity=0
 
         # Flatten the observation space
         self.observation_space = spaces.Box(
@@ -280,12 +280,13 @@ class QuadAirSimDroneEnv(AirSimEnv):
         #(a)----- proximity reward based on current distance from target
         dist_target = np.linalg.norm(target_position-drone_position)
         dist_reward=-1.5*dist_target
-        if dist_target < 3:
+        if dist_target < 5:
             print("close to target")
+            self.count_proximity+=1
             close_target_reward=1e3
-            if dist_target < 1:
+            if dist_target < 3:
                 print("target achieved")
-                close_target_reward=1e6
+                close_target_reward=1e7
                 done=True
         else:
             close_target_reward=0
@@ -388,30 +389,35 @@ class QuadAirSimDroneEnv(AirSimEnv):
     def _do_action(self,action):
         vx, vy, vz, yaw_action = self.interpret_action(action)
         act_time=0.5
-        if yaw_action is not None:  # Rotation
-            self.client.rotateByYawRateAsync(yaw_rate=yaw_action,duration=act_time).join()
-        else:  # Movement in the XY plane
-            self.client.moveByVelocityAsync(0.3*vx, 0.3*vy, 0.02*self.max_velocity,duration=act_time).join()
-        z_fixed=-5
         drone_state = self.client.getMultirotorState()
         state_pos = drone_state.kinematics_estimated.position
         current_z = float(state_pos.z_val)
-        count=0
-        while current_z < 1.5*z_fixed and count <5:
-            #print("down z")
-            count+=1
-            self.client.moveByVelocityAsync(0, 0, 0.1*self.max_velocity,duration=act_time).join()
-            drone_state = self.client.getMultirotorState()
-            state_pos = drone_state.kinematics_estimated.position
-            current_z = float(state_pos.z_val)
-        count=0
-        while current_z > 0.5*z_fixed and count<5:
-            #print("up z")
-            count+=1
-            self.client.moveByVelocityAsync(0, 0, -0.1*self.max_velocity,duration=act_time).join()
-            drone_state = self.client.getMultirotorState()
-            state_pos = drone_state.kinematics_estimated.position
-            current_z = float(state_pos.z_val)
+        z_fixed=-5
+        if yaw_action is not None:  # Rotation
+            self.client.rotateByYawRateAsync(yaw_rate=yaw_action,duration=act_time).join()
+        else:  # Movement in the XY plane
+            if current_z < 1.5*z_fixed: 
+                self.client.moveByVelocityAsync(0.3*vx, 0.3*vy, 0.1*self.max_velocity,duration=act_time).join()
+            elif current_z > 0.5*z_fixed:
+                self.client.moveByVelocityAsync(0, 0, -0.1*self.max_velocity,duration=act_time).join()    
+            else:
+                self.client.moveByVelocityAsync(0.3*vx, 0.3*vy, 0*self.max_velocity,duration=act_time).join()
+        # count=0
+        # while current_z < 1.5*z_fixed and count <5:
+        #     #print("down z")
+        #     count+=1
+        #     self.client.moveByVelocityAsync(0, 0, 0.1*self.max_velocity,duration=act_time).join()
+        #     drone_state = self.client.getMultirotorState()
+        #     state_pos = drone_state.kinematics_estimated.position
+        #     current_z = float(state_pos.z_val)
+        # count=0
+        # while current_z > 0.5*z_fixed and count<5:
+        #     #print("up z")
+        #     count+=1
+        #     self.client.moveByVelocityAsync(0, 0, -0.1*self.max_velocity,duration=act_time).join()
+        #     drone_state = self.client.getMultirotorState()
+        #     state_pos = drone_state.kinematics_estimated.position
+        #     current_z = float(state_pos.z_val)
     
     def step(self, action):
         done_point,done_path=False, False
@@ -426,7 +432,9 @@ class QuadAirSimDroneEnv(AirSimEnv):
         #insert the current observation and reward into the current list in case the drone reaches the target in the current episode
         self._log_step(obs,reward)
         #it means that the drone reached the target position
-        if done_point:
+        if done_point or self.count_proximity >10:
+            self.count_proximity=0
+            print("Done Point")
             #writes the current log into csv file
             self._log_episode_to_csv()
             done_path=self.update_points()
