@@ -1,0 +1,3 @@
+model,avg_rwd,max_episode_rwd,success_rate,Min_Collision,Avg_Steps
+PPO,-1521.6810777982075,-1122.2707405090332,0.0,0.0,0.0
+DQN,-5949.690129822505,-1015.6046867370605,0.0,0.0,0.0

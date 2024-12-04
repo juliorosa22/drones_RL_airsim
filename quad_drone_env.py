@@ -46,6 +46,7 @@ class QuadAirSimDroneEnv(AirSimEnv):
 
         #Information used to decide when stop the episode due agent random behavior
         self.sim_info = {
+            "done_points_counter":0,
             "collision_counter":0,
             "step_counter":0,
             "dist_to_target":0.0,
@@ -318,7 +319,7 @@ class QuadAirSimDroneEnv(AirSimEnv):
             
             self.sim_info['collision_counter']+=1
             collision_counter=self.sim_info['collision_counter']
-            print(f"collision: {collision_counter}")
+            #print(f"collision: {collision_counter}")
             collision_penalty = -(0.5*dist_target+1e3)*np.log(collision_counter)
             
 
@@ -434,15 +435,16 @@ class QuadAirSimDroneEnv(AirSimEnv):
         #it means that the drone reached the target position
         if done_point or self.count_proximity >10:
             self.count_proximity=0
+            self.sim_info['done_points_counter']+=1
             print("Done Point")
             #writes the current log into csv file
             self._log_episode_to_csv()
             done_path=self.update_points()
         
-        terminated = True if done_path else False # Finish the current episode in case all the points in the path were used
+        terminated = True if done_path or (done_point and step_count > 800)  else False # Finish the current episode in case all the points in the path were used
         # Truncate if reward drops below threshold
         truncated=False
-        if self.sim_info["collision_counter"] > 50 or step_count > 500 or  self.sim_info["dist_to_target"] > self.max_distance:
+        if self.sim_info["collision_counter"] > 50 or(self.sim_info['done_points_counter'] < 1 and step_count > 500)  or  self.sim_info["dist_to_target"] > self.max_distance:
             truncated=True
             print("Episode Truncated")
         
