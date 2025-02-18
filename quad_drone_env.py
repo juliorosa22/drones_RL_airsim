@@ -8,7 +8,7 @@ from path_handler import PathHandler
 import time
 import os
 import csv
-MAX_STEPS_PER_EPISODE=500
+MAX_STEPS_PER_EPISODE=1000
 LIDAR_FEAT_SIZE=600
 class QuadAirSimDroneEnv(AirSimEnv):
     
@@ -57,7 +57,7 @@ class QuadAirSimDroneEnv(AirSimEnv):
         
         #Log handlers
         self.csv_file_path = csv_file_log
-        self._initialize_csv()
+        #self._initialize_csv()
         self.episode_log = []  # Store all steps during the episode
         self.episode_id = 0  # Unique identifier for the episode where the agent reaches at least one target point
 
@@ -222,6 +222,7 @@ class QuadAirSimDroneEnv(AirSimEnv):
         # Reset environment and set to start position
         self.sim_info['collision_counter']=0
         self.sim_info['step_counter']=0
+        self.count_proximity=0
         self.update_path()
         self._setup_flight()
         # Get initial observation
@@ -287,6 +288,95 @@ class QuadAirSimDroneEnv(AirSimEnv):
             close_target_reward=1e3
             if dist_target < 3:
                 print("target achieved")
+                close_target_reward=1e4
+                done=True
+        else:
+            close_target_reward=0
+
+         
+        #(c)-----  Reward based on the displacement
+        previous_distance_to_target = np.linalg.norm(previous_position - target_position)
+        current_distance_to_target = np.linalg.norm(drone_position - target_position)
+        delta_displacement= previous_distance_to_target - current_distance_to_target
+        displacement_reward= displ_weight*dist_target if delta_displacement > 0 else 0
+        
+             
+
+        # ---- 2. LiDAR Based ----
+        # Parse LiDAR data into 3D point cloud
+        lidar_points=obs["lidar_points"]
+        check_lidar=np.any(lidar_points!=0)
+        lidar_points=self.parse_lidarData(lidar_points)
+        if check_lidar:
+            distances_to_points = np.linalg.norm(lidar_points, axis=1)
+            average_distance = np.mean(distances_to_points)                
+            #penalty for proximity with obstacles
+            if average_distance < self.min_dist_obs * 1.5:
+                print("Close to obstacle")                   
+                lidar_penalty = -lidar_pen_weight*dist_target*1e3
+         # ---- 3. Collision Penalty ----
+        collision = self.client.simGetCollisionInfo().has_collided
+        if collision:
+            
+            self.sim_info['collision_counter']+=1
+            collision_counter=self.sim_info['collision_counter']
+            #print(f"collision: {collision_counter}")
+            collision_penalty = -(0.5*dist_target+1e4)*np.log(collision_counter)
+            
+
+        
+        time_penalty = -0.01 * self.sim_info['step_counter']
+
+        total_reward = ( 
+            close_target_reward+
+            dist_reward+
+            #displacement_reward+
+            lidar_penalty+
+            collision_penalty+
+            time_penalty
+        )
+        
+            
+        total_reward = float(total_reward)
+        #update the simulation information for logs or truncate the episode
+        self.sim_info['reward_components']=[close_target_reward,dist_reward,displacement_reward,lidar_penalty,collision_penalty,time_penalty]
+        self.sim_info['reward_names']=['close_target_reward','dist_reward','displacement_reward','lidar_penalty','collision_penalty','time_penalty']
+        self.sim_info['dist_to_target']=dist_target
+
+        # Update state for next reward calculation
+        self.previous_position = drone_position
+
+        return total_reward, done
+    
+    def simple_reward(self,obs):
+        done=False
+        # Extract required observation data
+        drone_position = obs["drone_position"]
+        previous_position = self.previous_position
+        target_position = self.target_position
+        #lidar_data = self.client.getLidarData()
+        
+        # Initialize rewards and penalties
+        close_target_reward=0.0 #(a): range 0 or 1
+        dist_reward=0
+        displacement_reward = 0.0 #(c): range 0 or 0.5
+        lidar_penalty = 0.0 # (g): range[0,1] based on the percentage of distances below the threshold
+        collision_penalty = 0.0
+        
+        ##weights for each component of reward based on distance to target
+        displ_weight=0.1
+        lidar_pen_weight=0.25
+
+        # ---- 1. Distance Based ----
+        #(a)----- proximity reward based on current distance from target
+        dist_target = np.linalg.norm(target_position-drone_position)
+        dist_reward=-1.5*dist_target
+        if dist_target < 5:
+            print("close to target")
+            self.count_proximity+=1
+            close_target_reward=1e3
+            if dist_target < 3:
+                print("target achieved")
                 close_target_reward=1e7
                 done=True
         else:
@@ -312,7 +402,7 @@ class QuadAirSimDroneEnv(AirSimEnv):
             #penalty for proximity with obstacles
             if average_distance < self.min_dist_obs * 1.5:
                 print("Close to obstacle")                   
-                lidar_penalty = -lidar_pen_weight*dist_target
+                lidar_penalty = -lidar_pen_weight*dist_target*1e3
          # ---- 3. Collision Penalty ----
         collision = self.client.simGetCollisionInfo().has_collided
         if collision:
@@ -320,7 +410,7 @@ class QuadAirSimDroneEnv(AirSimEnv):
             self.sim_info['collision_counter']+=1
             collision_counter=self.sim_info['collision_counter']
             #print(f"collision: {collision_counter}")
-            collision_penalty = -(0.5*dist_target+1e3)*np.log(collision_counter)
+            collision_penalty = -(0.5*dist_target+1e4)*np.log(collision_counter)
             
 
         
@@ -359,6 +449,7 @@ class QuadAirSimDroneEnv(AirSimEnv):
         5: Rotate Right (90 degrees)
         6: Rotate Left (90 degrees)
         """
+        #print(f"Action:{action}")
         angle=45
         vx, vy, vz = 0.0, 0.0, 0.0
         yaw_action = None
@@ -400,7 +491,7 @@ class QuadAirSimDroneEnv(AirSimEnv):
             if current_z < 1.5*z_fixed: 
                 self.client.moveByVelocityAsync(0.3*vx, 0.3*vy, 0.1*self.max_velocity,duration=act_time).join()
             elif current_z > 0.5*z_fixed:
-                self.client.moveByVelocityAsync(0, 0, -0.1*self.max_velocity,duration=act_time).join()    
+                self.client.moveByVelocityAsync(0.3*vx, 0.3*vy, -0.1*self.max_velocity,duration=act_time).join()    
             else:
                 self.client.moveByVelocityAsync(0.3*vx, 0.3*vy, 0*self.max_velocity,duration=act_time).join()
         # count=0
@@ -431,20 +522,20 @@ class QuadAirSimDroneEnv(AirSimEnv):
         
         reward, done_point = self._compute_reward(obs)
         #insert the current observation and reward into the current list in case the drone reaches the target in the current episode
-        self._log_step(obs,reward)
+        #self._log_step(obs,reward)
         #it means that the drone reached the target position
-        if done_point or self.count_proximity >10:
+        if done_point or self.count_proximity>3:
             self.count_proximity=0
             self.sim_info['done_points_counter']+=1
             print("Done Point")
             #writes the current log into csv file
-            self._log_episode_to_csv()
+            #self._log_episode_to_csv()
             done_path=self.update_points()
         
         terminated = True if done_path or (done_point and step_count > 800)  else False # Finish the current episode in case all the points in the path were used
         # Truncate if reward drops below threshold
         truncated=False
-        if self.sim_info["collision_counter"] > 50 or(self.sim_info['done_points_counter'] < 1 and step_count > 500)  or  self.sim_info["dist_to_target"] > self.max_distance:
+        if self.sim_info["collision_counter"] > 50 or(self.sim_info['done_points_counter'] < 1 and step_count > 500) or step_count > MAX_STEPS_PER_EPISODE  or  self.sim_info["dist_to_target"] > self.max_distance:
             truncated=True
             print("Episode Truncated")
         
