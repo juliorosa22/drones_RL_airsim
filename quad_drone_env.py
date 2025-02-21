@@ -6,9 +6,10 @@ from airgym.envs.airsim_env import AirSimEnv
 from scipy.spatial.transform import Rotation as R
 from path_handler import PathHandler
 import time
+import math
 import os
 import csv
-MAX_STEPS_PER_EPISODE=1000
+MAX_STEPS_PER_EPISODE=5000
 LIDAR_FEAT_SIZE=600
 class QuadAirSimDroneEnv(AirSimEnv):
     
@@ -166,8 +167,9 @@ class QuadAirSimDroneEnv(AirSimEnv):
 
         # Calculate the relative yaw between drone's current yaw and the target yaw
         relative_yaw = target_yaw - current_yaw
+
         # Normalize relative yaw to the range [-pi, pi]
-        relative_yaw = (relative_yaw + np.pi) % (2 * np.pi) - np.pi
+        relative_yaw = abs((relative_yaw + np.pi) % (2 * np.pi) - np.pi)
         return relative_yaw.astype(np.float32)
 
     def parse_lidarData(self, data):
@@ -314,7 +316,8 @@ class QuadAirSimDroneEnv(AirSimEnv):
             if average_distance < self.min_dist_obs * 1.5:
                 print("Close to obstacle")                   
                 lidar_penalty = -lidar_pen_weight*dist_target*1e3
-         # ---- 3. Collision Penalty ----
+        
+        # ---- 3. Collision Penalty ----
         collision = self.client.simGetCollisionInfo().has_collided
         if collision:
             
@@ -352,46 +355,51 @@ class QuadAirSimDroneEnv(AirSimEnv):
         done=False
         # Extract required observation data
         drone_position = obs["drone_position"]
-        previous_position = self.previous_position
+        #previous_position = self.previous_position
         target_position = self.target_position
         #lidar_data = self.client.getLidarData()
         
         # Initialize rewards and penalties
         close_target_reward=0.0 #(a): range 0 or 1
-        dist_reward=0
-        displacement_reward = 0.0 #(c): range 0 or 0.5
-        lidar_penalty = 0.0 # (g): range[0,1] based on the percentage of distances below the threshold
-        collision_penalty = 0.0
+        displacement_penalty = 0.0 #(c): range 0 or -max(dist)
+        lidar_penalty = 0.0 # range 0 or -10
+        #collision_penalty = 0.0
         
-        ##weights for each component of reward based on distance to target
-        displ_weight=0.1
-        lidar_pen_weight=0.25
-
+        
         # ---- 1. Distance Based ----
-        #(a)----- proximity reward based on current distance from target
-        dist_target = np.linalg.norm(target_position-drone_position)
-        dist_reward=-1.5*dist_target
-        if dist_target < 5:
+        #(a)-----  penalty based on the current distance to target position
+        current_distance = np.linalg.norm(drone_position - target_position)
+        distance_penalty= -current_distance#displ_weight*dist_target if delta_displacement > 0 else 0
+        
+        #(b)----- proximity reward based on current distance from target
+        if current_distance < 5:
             print("close to target")
             self.count_proximity+=1
-            close_target_reward=1e3
-            if dist_target < 3:
+            close_target_reward=10
+            if current_distance < 2:
                 print("target achieved")
-                close_target_reward=1e7
+                close_target_reward=100
                 done=True
         else:
             close_target_reward=0
 
-         
-        #(c)-----  Reward based on the displacement
-        previous_distance_to_target = np.linalg.norm(previous_position - target_position)
-        current_distance_to_target = np.linalg.norm(drone_position - target_position)
-        delta_displacement= previous_distance_to_target - current_distance_to_target
-        displacement_reward= displ_weight*dist_target if delta_displacement > 0 else 0
+        # --- 2. Drone YAW alignment with the target position
+        #TODO : create a penalty when the drone is not facing the direction of the target
+        # in order to do this using the angle between the drone yaw and the target position. Apply the penalty when the angle between them is bigger than 45º degrees
+        # ---- 2. Yaw Alignment Penalty ----
+        # Extract drone's orientation (quaternion)
+        drone_yaw = obs["orientation"][2]  # Angle in radians
         
-             
+        # Compute desired yaw angle (from drone to target)
+        relative_yaw = self._get_relative_yaw_to_target(drone_position,drone_yaw)
+        # Ensure angle is within [0, 180] range
+        yaw_penalty=0
+        if relative_yaw > (np.pi/4):
+            #print(f"Yaw missalignment:{math.degrees(relative_yaw)}")
+            yaw_penalty = -5
 
-        # ---- 2. LiDAR Based ----
+                
+        # ---- 3. LiDAR Based ----
         # Parse LiDAR data into 3D point cloud
         lidar_points=obs["lidar_points"]
         check_lidar=np.any(lidar_points!=0)
@@ -400,37 +408,35 @@ class QuadAirSimDroneEnv(AirSimEnv):
             distances_to_points = np.linalg.norm(lidar_points, axis=1)
             average_distance = np.mean(distances_to_points)                
             #penalty for proximity with obstacles
-            if average_distance < self.min_dist_obs * 1.5:
+            if average_distance < self.min_dist_obs :
                 print("Close to obstacle")                   
-                lidar_penalty = -lidar_pen_weight*dist_target*1e3
-         # ---- 3. Collision Penalty ----
+                lidar_penalty = -100
+        
+        # ---- 4. Collision Counter increment ----
         collision = self.client.simGetCollisionInfo().has_collided
         if collision:
-            
             self.sim_info['collision_counter']+=1
-            collision_counter=self.sim_info['collision_counter']
-            #print(f"collision: {collision_counter}")
-            collision_penalty = -(0.5*dist_target+1e4)*np.log(collision_counter)
+            #collision_penalty = -1e2
             
 
-        
-        time_penalty = -0.01 * self.sim_info['step_counter']
-
+        #---- 5. Time Penalty ----
+        time_penalty = -0.5 
+        ## Total reward composition
         total_reward = ( 
             close_target_reward+
-            dist_reward+
-            #displacement_reward+
+            distance_penalty+
             lidar_penalty+
-            collision_penalty+
+            yaw_penalty+
+            #collision_penalty+
             time_penalty
         )
         
             
         total_reward = float(total_reward)
         #update the simulation information for logs or truncate the episode
-        self.sim_info['reward_components']=[close_target_reward,dist_reward,displacement_reward,lidar_penalty,collision_penalty,time_penalty]
-        self.sim_info['reward_names']=['close_target_reward','dist_reward','displacement_reward','lidar_penalty','collision_penalty','time_penalty']
-        self.sim_info['dist_to_target']=dist_target
+        self.sim_info['reward_components']=[close_target_reward,distance_penalty,lidar_penalty,yaw_penalty,time_penalty]
+        self.sim_info['reward_names']=['close_target_reward','distance_penalty','lidar_penalty','yaw_penalty','time_penalty']
+        self.sim_info['dist_to_target']=current_distance
 
         # Update state for next reward calculation
         self.previous_position = drone_position
@@ -520,11 +526,11 @@ class QuadAirSimDroneEnv(AirSimEnv):
         vec_obs=self._get_obs()
         obs = self.parse_flattened_obs(vec_obs)
         
-        reward, done_point = self._compute_reward(obs)
+        reward, done_point = self.simple_reward(obs)#self._compute_reward(obs)
         #insert the current observation and reward into the current list in case the drone reaches the target in the current episode
         #self._log_step(obs,reward)
-        #it means that the drone reached the target position
-        if done_point or self.count_proximity>3:
+        #it means that the drone has reached the target position
+        if done_point or self.count_proximity>5:
             self.count_proximity=0
             self.sim_info['done_points_counter']+=1
             print("Done Point")
@@ -535,7 +541,7 @@ class QuadAirSimDroneEnv(AirSimEnv):
         terminated = True if done_path or (done_point and step_count > 800)  else False # Finish the current episode in case all the points in the path were used
         # Truncate if reward drops below threshold
         truncated=False
-        if self.sim_info["collision_counter"] > 50 or(self.sim_info['done_points_counter'] < 1 and step_count > 500) or step_count > MAX_STEPS_PER_EPISODE  or  self.sim_info["dist_to_target"] > self.max_distance:
+        if self.sim_info["collision_counter"] > 100 or(self.sim_info['done_points_counter'] < 1 and step_count > 1000) or step_count > MAX_STEPS_PER_EPISODE  or  self.sim_info["dist_to_target"] > self.max_distance:
             truncated=True
             print("Episode Truncated")
         
