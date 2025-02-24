@@ -9,7 +9,7 @@ import time
 import math
 import os
 import csv
-MAX_STEPS_PER_EPISODE=5000
+MAX_STEPS_PER_EPISODE=2000
 LIDAR_FEAT_SIZE=600
 class QuadAirSimDroneEnv(AirSimEnv):
     
@@ -43,7 +43,7 @@ class QuadAirSimDroneEnv(AirSimEnv):
             shape=(9+LIDAR_FEAT_SIZE,),
             dtype=np.float32
         )
-        self.action_space = spaces.Discrete(7)
+        self.action_space = spaces.Discrete(6)
 
         #Information used to decide when stop the episode due agent random behavior
         self.sim_info = {
@@ -375,17 +375,14 @@ class QuadAirSimDroneEnv(AirSimEnv):
         if current_distance < 5:
             print("close to target")
             self.count_proximity+=1
-            close_target_reward=10
-            if current_distance < 2:
-                print("target achieved")
+            #close_target_reward=10
+            if current_distance < 1:
+                print("target reached")
                 close_target_reward=100
                 done=True
         else:
             close_target_reward=0
 
-        # --- 2. Drone YAW alignment with the target position
-        #TODO : create a penalty when the drone is not facing the direction of the target
-        # in order to do this using the angle between the drone yaw and the target position. Apply the penalty when the angle between them is bigger than 45º degrees
         # ---- 2. Yaw Alignment Penalty ----
         # Extract drone's orientation (quaternion)
         drone_yaw = obs["orientation"][2]  # Angle in radians
@@ -394,7 +391,7 @@ class QuadAirSimDroneEnv(AirSimEnv):
         relative_yaw = self._get_relative_yaw_to_target(drone_position,drone_yaw)
         # Ensure angle is within [0, 180] range
         yaw_penalty=0
-        if relative_yaw > (np.pi/4):
+        if relative_yaw > (np.pi/3):
             #print(f"Yaw missalignment:{math.degrees(relative_yaw)}")
             yaw_penalty = -5
 
@@ -408,7 +405,7 @@ class QuadAirSimDroneEnv(AirSimEnv):
             distances_to_points = np.linalg.norm(lidar_points, axis=1)
             average_distance = np.mean(distances_to_points)                
             #penalty for proximity with obstacles
-            if average_distance < self.min_dist_obs :
+            if average_distance < self.min_dist_obs*0.75 :
                 print("Close to obstacle")                   
                 lidar_penalty = -100
         
@@ -447,37 +444,34 @@ class QuadAirSimDroneEnv(AirSimEnv):
         """
         Interpret discrete action into velocity and yaw commands.
         Actions:
-        0: Hover
-        1: Move Forward
-        2: Move Backward
-        3: Move Right
-        4: Move Left
-        5: Rotate Right (90 degrees)
-        6: Rotate Left (90 degrees)
+        0: Move Forward
+        1: Move Backward
+        2: Move Right
+        3: Move Left
+        4: Rotate Right (90 degrees)
+        5: Rotate Left (90 degrees)
         """
         #print(f"Action:{action}")
         angle=45
         vx, vy, vz = 0.0, 0.0, 0.0
         yaw_action = None
 
-        if action == 0:  # Hover
-            pass  # No movement
-        elif action == 1:  # Move Forward
+        if action == 0:  # Move Forward
             vx = -self.max_velocity
             vz=self.max_velocity
-        elif action == 2:  # Move Backward
+        elif action == 1:  # Move Backward
             vx = self.max_velocity
             vz=self.max_velocity
-        elif action == 3:  # Move Right
+        elif action == 2:  # Move Right
             vy = -self.max_velocity
             vz=self.max_velocity
-        elif action == 4:  # Move Left
+        elif action == 3:  # Move Left
             vy = self.max_velocity
             vz=self.max_velocity
-        elif action == 5:  # Rotate Right (90 degrees)
+        elif action == 4:  # Rotate Right (90 degrees)
             yaw_action= angle
             #yaw_action = np.degrees(self.drone_orientation[2] + np.pi / 2)  # Add 90 degrees
-        elif action == 6:  # Rotate Left (90 degrees)
+        elif action == 5:  # Rotate Left (90 degrees)
             yaw_action=-angle
             #yaw_action = np.degrees(self.drone_orientation[2] - np.pi / 2)  # Subtract 90 degrees
 
@@ -486,36 +480,22 @@ class QuadAirSimDroneEnv(AirSimEnv):
 
     def _do_action(self,action):
         vx, vy, vz, yaw_action = self.interpret_action(action)
-        act_time=0.5
+        act_time=1
         drone_state = self.client.getMultirotorState()
         state_pos = drone_state.kinematics_estimated.position
         current_z = float(state_pos.z_val)
+        perc_v=0.3
         z_fixed=-5
         if yaw_action is not None:  # Rotation
             self.client.rotateByYawRateAsync(yaw_rate=yaw_action,duration=act_time).join()
         else:  # Movement in the XY plane
             if current_z < 1.5*z_fixed: 
-                self.client.moveByVelocityAsync(0.3*vx, 0.3*vy, 0.1*self.max_velocity,duration=act_time).join()
+                self.client.moveByVelocityAsync(perc_v*vx, perc_v*vy, 0.1*self.max_velocity,duration=act_time).join()
             elif current_z > 0.5*z_fixed:
-                self.client.moveByVelocityAsync(0.3*vx, 0.3*vy, -0.1*self.max_velocity,duration=act_time).join()    
+                self.client.moveByVelocityAsync(perc_v*vx, perc_v*vy, -0.1*self.max_velocity,duration=act_time).join()    
             else:
-                self.client.moveByVelocityAsync(0.3*vx, 0.3*vy, 0*self.max_velocity,duration=act_time).join()
-        # count=0
-        # while current_z < 1.5*z_fixed and count <5:
-        #     #print("down z")
-        #     count+=1
-        #     self.client.moveByVelocityAsync(0, 0, 0.1*self.max_velocity,duration=act_time).join()
-        #     drone_state = self.client.getMultirotorState()
-        #     state_pos = drone_state.kinematics_estimated.position
-        #     current_z = float(state_pos.z_val)
-        # count=0
-        # while current_z > 0.5*z_fixed and count<5:
-        #     #print("up z")
-        #     count+=1
-        #     self.client.moveByVelocityAsync(0, 0, -0.1*self.max_velocity,duration=act_time).join()
-        #     drone_state = self.client.getMultirotorState()
-        #     state_pos = drone_state.kinematics_estimated.position
-        #     current_z = float(state_pos.z_val)
+                self.client.moveByVelocityAsync(perc_v*vx, perc_v*vy, 0*self.max_velocity,duration=act_time).join()
+      
     
     def step(self, action):
         done_point,done_path=False, False
@@ -530,23 +510,35 @@ class QuadAirSimDroneEnv(AirSimEnv):
         #insert the current observation and reward into the current list in case the drone reaches the target in the current episode
         #self._log_step(obs,reward)
         #it means that the drone has reached the target position
-        if done_point or self.count_proximity>5:
+        if done_point or self.count_proximity>10:
             self.count_proximity=0
             self.sim_info['done_points_counter']+=1
-            print("Done Point")
+            print("Target reached")
             #writes the current log into csv file
             #self._log_episode_to_csv()
             done_path=self.update_points()
-        
-        terminated = True if done_path or (done_point and step_count > 800)  else False # Finish the current episode in case all the points in the path were used
+        if done_path:
+            print(f"Next target:{self.target_position}")
+        terminated = True if done_path else False #or (done_point and step_count > MAX_STEPS_PER_EPISODE)  else False # Finish the current episode in case all the points in the path were used
         # Truncate if reward drops below threshold
         truncated=False
-        if self.sim_info["collision_counter"] > 100 or(self.sim_info['done_points_counter'] < 1 and step_count > 1000) or step_count > MAX_STEPS_PER_EPISODE  or  self.sim_info["dist_to_target"] > self.max_distance:
+        if self.sim_info["collision_counter"] > 100:
+            print("Episode Truncated Max Limit collision")
             truncated=True
-            print("Episode Truncated")
+        elif self.sim_info['done_points_counter'] < 1 and step_count > 1000:
+            print("Episode Truncated too many steps no purpose")
+            truncated=True
+        elif step_count > MAX_STEPS_PER_EPISODE:  
+            print("Episode Truncated: Max steps achieved")
+            truncated=True
+        elif self.sim_info["dist_to_target"] > self.max_distance:
+            truncated=True
+            print("Episode Truncated: Agent too far from the target")
         
         #updates the current episode id
         if terminated or truncated:
+            if terminated:
+                print("Sucessful episode")
             self.episode_id+=1
         
             
